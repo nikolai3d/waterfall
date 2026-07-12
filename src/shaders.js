@@ -369,6 +369,177 @@ void main() {
 }
 `;
 
+  // --- Screen-space fluid rendering ------------------------------------
+  // Depth pass: same sphere impostors, but output linear view-space depth
+  // to an R32F target (0 = no water). gl_FragDepth still set for z-test
+  // against the raytraced rocks/walls sharing the depth attachment.
+  const fsPointDepth = header + `
+uniform mat4 uProj;
+flat in vec3 vCenterV;
+flat in float vSpeed;
+out vec4 o;
+
+void main() {
+  vec2 q = gl_PointCoord * 2.0 - 1.0;
+  q.y = -q.y;
+  float r2 = dot(q, q);
+  if (r2 > 1.0) discard;
+  vec3 fp = vCenterV + vec3(q, sqrt(1.0 - r2)) * PRADIUS;
+  vec4 clip = uProj * vec4(fp, 1.0);
+  gl_FragDepth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
+  o = vec4(-fp.z, 0.0, 0.0, 1.0);
+}
+`;
+
+  // Thickness pass: soft additive sprites into a half-res RG target.
+  // R = thickness, G = speed-weighted thickness (average speed -> foam).
+  const vsThick = header + `
+uniform sampler2D uPos, uVel;
+uniform mat4 uProj, uView;
+uniform float uPointScale;
+flat out float vSpeed;
+
+void main() {
+  ivec2 pt = ivec2(gl_VertexID % PTEX, gl_VertexID / PTEX);
+  vec4 pa = texelFetch(uPos, pt, 0);
+  if (pa.w < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vSpeed = 0.0; return; }
+  vec3 wp = pa.xyz * (2.0 / GRIDF) - 1.0;
+  vec4 vp = uView * vec4(wp, 1.0);
+  gl_Position = uProj * vp;
+  gl_PointSize = clamp(uPointScale * PRADIUS * 1.7 / max(-vp.z, 0.05), 1.0, 96.0);
+  vSpeed = texelFetch(uVel, pt, 0).w / VMAX;
+}
+`;
+
+  const fsThick = header + `
+flat in float vSpeed;
+out vec4 o;
+
+void main() {
+  vec2 q = gl_PointCoord * 2.0 - 1.0;
+  float r2 = dot(q, q);
+  if (r2 > 1.0) discard;
+  float f = 1.0 - r2;
+  float th = f * f * PRADIUS * 2.0;
+  o = vec4(th, th * vSpeed, 0.0, 1.0);
+}
+`;
+
+  // Separable depth-aware blur (simplified narrow-range filter) on the
+  // linear water depth. Radius shrinks with distance so smoothing is
+  // roughly constant in world space.
+  const fsBlur = header + `
+uniform sampler2D uDepth;
+uniform vec2 uDir;      // (1,0) or (0,1), in texels
+uniform float uScalePx; // pixels per world unit at z = 1
+out vec4 o;
+
+const float NRANGE = 0.10; // reject neighbors further than this in depth
+
+float dfetch(ivec2 t) {
+  ivec2 s = textureSize(uDepth, 0);
+  return texelFetch(uDepth, clamp(t, ivec2(0), s - 1), 0).r;
+}
+
+void main() {
+  ivec2 tx = ivec2(gl_FragCoord.xy);
+  float z0 = texelFetch(uDepth, tx, 0).r;
+  if (z0 <= 0.0) { o = vec4(0.0); return; }
+
+  float radius = clamp(0.045 * uScalePx / z0, 2.0, 20.0);
+  float sum = z0, wsum = 1.0;
+  ivec2 dir = ivec2(uDir);
+  for (int i = 1; i <= 20; i++) {
+    float fi = float(i);
+    if (fi > radius) break;
+    float g = exp(-fi * fi / (0.5 * radius * radius));
+    float za = dfetch(tx + dir * i);
+    float zb = dfetch(tx - dir * i);
+    if (za > 0.0 && abs(za - z0) < NRANGE) { sum += za * g; wsum += g; }
+    if (zb > 0.0 && abs(zb - z0) < NRANGE) { sum += zb * g; wsum += g; }
+  }
+  o = vec4(sum / wsum, 0.0, 0.0, 1.0);
+}
+`;
+
+  // Composite: reconstruct the water surface from smoothed depth and shade
+  // it (refraction, Beer-Lambert absorption, Fresnel, spec, foam) over the
+  // scene color. Pixels without water pass the scene through.
+  const fsComposite = header + `
+uniform sampler2D uScene, uDepthS, uThick;
+uniform vec2 uRes;
+uniform float uTanF, uAspect;
+uniform vec3 uLightV; // light direction in view space
+out vec4 o;
+
+vec3 viewRay(vec2 frag) {
+  vec2 uv = frag / uRes * 2.0 - 1.0;
+  return vec3(uv.x * uTanF * uAspect, uv.y * uTanF, -1.0);
+}
+
+float dfetch(ivec2 t) {
+  ivec2 s = textureSize(uDepthS, 0);
+  return texelFetch(uDepthS, clamp(t, ivec2(0), s - 1), 0).r;
+}
+
+vec3 viewPos(ivec2 tx, float z) {
+  return viewRay(vec2(tx) + 0.5) * z;
+}
+
+void main() {
+  ivec2 tx = ivec2(gl_FragCoord.xy);
+  vec2 tuv = gl_FragCoord.xy / uRes;
+  vec3 scene = texture(uScene, tuv).rgb;
+  float z0 = texelFetch(uDepthS, tx, 0).r;
+  if (z0 <= 0.0) { o = vec4(scene, 1.0); return; }
+
+  vec3 P = viewPos(tx, z0);
+
+  // Normal from finite differences, taking the smoother side on each axis.
+  float zx1 = dfetch(tx + ivec2(1, 0)); if (zx1 <= 0.0 || abs(zx1 - z0) > 0.3) zx1 = z0;
+  float zx2 = dfetch(tx - ivec2(1, 0)); if (zx2 <= 0.0 || abs(zx2 - z0) > 0.3) zx2 = z0;
+  float zy1 = dfetch(tx + ivec2(0, 1)); if (zy1 <= 0.0 || abs(zy1 - z0) > 0.3) zy1 = z0;
+  float zy2 = dfetch(tx - ivec2(0, 1)); if (zy2 <= 0.0 || abs(zy2 - z0) > 0.3) zy2 = z0;
+  vec3 dx = (abs(zx1 - z0) < abs(zx2 - z0))
+    ? viewPos(tx + ivec2(1, 0), zx1) - P
+    : P - viewPos(tx - ivec2(1, 0), zx2);
+  vec3 dy = (abs(zy1 - z0) < abs(zy2 - z0))
+    ? viewPos(tx + ivec2(0, 1), zy1) - P
+    : P - viewPos(tx - ivec2(0, 1), zy2);
+  vec3 n = normalize(cross(dx, dy));
+  if (n.z < 0.0) n = -n;
+
+  vec2 t2 = texture(uThick, tuv).rg;
+  float th = t2.r * 3.0;
+  float speed = t2.g / max(t2.r, 1e-4);
+
+  // Refract the background through the surface.
+  vec2 off = n.xy * clamp(th, 0.0, 1.5) * 0.06;
+  vec3 refr = texture(uScene, clamp(tuv + off, vec2(0.001), vec2(0.999))).rgb;
+
+  // Beer-Lambert absorption, red first (deep water goes blue-green).
+  vec3 col = refr * exp(-vec3(2.6, 1.0, 0.55) * th);
+  col += vec3(0.04, 0.16, 0.24) * (1.0 - exp(-th * 2.5)); // in-scatter
+
+  vec3 e = normalize(-P);
+  float fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, e), 0.0), 5.0);
+  col = mix(col, vec3(0.35, 0.50, 0.60), fres * 0.8);
+  vec3 hv = normalize(uLightV + e);
+  col += vec3(0.9) * pow(max(dot(n, hv), 0.0), 120.0);
+
+  float foam = smoothstep(0.45, 0.9, speed);
+  col = mix(col, vec3(0.93, 0.97, 1.0), foam * 0.75);
+  o = vec4(col, 1.0);
+}
+`;
+
+  // Trivial pass-through used by the legacy points mode.
+  const fsBlit = header + `
+uniform sampler2D uScene;
+out vec4 o;
+void main() { o = vec4(texelFetch(uScene, ivec2(gl_FragCoord.xy), 0).rgb, 1.0); }
+`;
+
   // Background: analytic raytrace of the cube interior and rock spheres,
   // writing correct depth so particles composite against it.
   const fsBackground = header + `
@@ -467,5 +638,6 @@ void main() {
   return {
     vsQuad, vsP2G1, vsP2G2, fsScatter, fsDensity, fsGrid, fsG2P,
     vsPoint, fsPoint, fsBackground,
+    fsPointDepth, vsThick, fsThick, fsBlur, fsComposite, fsBlit,
   };
 }

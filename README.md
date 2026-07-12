@@ -19,7 +19,8 @@ python3 -m http.server 8123
 # then open http://localhost:8123
 ```
 
-Controls: **drag** to orbit, **wheel** to zoom, **space** to pause.
+Controls: **drag** to orbit, **wheel** to zoom, **space** to pause,
+**f** to toggle between the water surface and raw particle view.
 
 ## How it works
 
@@ -43,8 +44,22 @@ float textures and runs in shaders. Per substep:
 
 The 64³ grid is tiled into a 512×512 2D texture (WebGL2 can't render into 3D
 textures per-slice with blending). Rocks and walls are raytraced analytically
-in a fragment shader that writes real depth, so the particle spheres
-composite correctly against them.
+in a fragment shader that writes real depth, so the water composites
+correctly against them.
+
+### Rendering
+
+The water surface uses **screen-space fluid rendering** (van der Laan et al.,
+I3D 2009): sphere impostors write linear view-space depth to an offscreen
+target (z-tested against the raytraced scene depth), a depth-aware separable
+blur smooths it into a continuous surface, and an additive half-resolution
+pass accumulates thickness plus a speed-weighted foam channel. A composite
+pass reconstructs normals from the smoothed depth and shades the surface:
+refraction of the scene, Beer–Lambert absorption by thickness, Fresnel,
+specular, and foam. Press **f** (or `?r=points`) for the raw shaded-particle
+view. Known simplification: the thickness pass has no occlusion test, so
+water behind a rock still contributes thickness where nearer water is
+visible — visually minor.
 
 ## URL parameters
 
@@ -54,6 +69,7 @@ composite correctly against them.
 | `s`    | 2       | simulation substeps per frame                    |
 | `l`    | 2600    | particle lifetime in substeps (spout recycling)  |
 | `warm` | 0       | substeps to pre-simulate before the first frame  |
+| `r`    | `ssf`   | rendering: `ssf` (water surface) or `points`     |
 | `dbg`  | off     | overlay with GPU-readback particle statistics    |
 
 Example: [`?p=128&s=3`](http://localhost:8123/?p=128&s=3) for slower machines.

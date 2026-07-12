@@ -69,10 +69,27 @@ function u(prog, name) {
   return m.get(name);
 }
 
-function createTex(w, h, data = null) {
+function createTex(w, h, data = null, internal = gl.RGBA32F, filter = gl.NEAREST) {
+  const fmt = {
+    [gl.RGBA32F]: [gl.RGBA, gl.FLOAT],
+    [gl.R32F]: [gl.RED, gl.FLOAT],
+    [gl.RG16F]: [gl.RG, gl.HALF_FLOAT],
+    [gl.RGBA8]: [gl.RGBA, gl.UNSIGNED_BYTE],
+  }[internal];
   const t = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, t);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, data);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, fmt[0], fmt[1], data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+
+function createDepthTex(w, h) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, w, h, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -80,7 +97,7 @@ function createTex(w, h, data = null) {
   return t;
 }
 
-function createFBO(textures) {
+function createFBO(textures, depthTex = null) {
   const f = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, f);
   const bufs = textures.map((t, i) => {
@@ -88,6 +105,9 @@ function createFBO(textures) {
     return gl.COLOR_ATTACHMENT0 + i;
   });
   gl.drawBuffers(bufs);
+  if (depthTex) {
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depthTex, 0);
+  }
   if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
     fail('Framebuffer incomplete (float render targets unsupported?).');
   }
@@ -111,6 +131,11 @@ const progGrid = compile(S.vsQuad, S.fsGrid, 'grid');
 const progG2P = compile(S.vsQuad, S.fsG2P, 'g2p');
 const progBG = compile(S.vsQuad, S.fsBackground, 'background');
 const progPoints = compile(S.vsPoint, S.fsPoint, 'points');
+const progPointDepth = compile(S.vsPoint, S.fsPointDepth, 'pointDepth');
+const progThick = compile(S.vsThick, S.fsThick, 'thickness');
+const progBlur = compile(S.vsQuad, S.fsBlur, 'blur');
+const progComposite = compile(S.vsQuad, S.fsComposite, 'composite');
+const progBlit = compile(S.vsQuad, S.fsBlit, 'blit');
 
 const vao = gl.createVertexArray();
 gl.bindVertexArray(vao);
@@ -175,6 +200,36 @@ const gridBFBO = createFBO([gridB]);
 
 const densTex = createTex(PTEX, PTEX);
 const densFBO = createFBO([densTex]);
+
+// Screen-space fluid rendering targets (recreated on resize).
+let RT = null;
+
+function createTargets(w, h) {
+  if (RT) {
+    for (const t of RT.textures) gl.deleteTexture(t);
+    for (const f of RT.fbos) gl.deleteFramebuffer(f);
+  }
+  const hw = Math.max(1, Math.ceil(w / 2));
+  const hh = Math.max(1, Math.ceil(h / 2));
+  const sceneColor = createTex(w, h, null, gl.RGBA8, gl.LINEAR);
+  const depthTex = createDepthTex(w, h);
+  const waterDepth = createTex(w, h, null, gl.R32F);
+  const blurA = createTex(w, h, null, gl.R32F);
+  const blurB = createTex(w, h, null, gl.R32F);
+  const thick = createTex(hw, hh, null, gl.RG16F, gl.LINEAR);
+  RT = {
+    w, h, hw, hh,
+    sceneColor, waterDepth, blurA, blurB, thick,
+    sceneFBO: createFBO([sceneColor], depthTex),
+    waterFBO: createFBO([waterDepth], depthTex), // shares the scene depth
+    blurAFBO: createFBO([blurA]),
+    blurBFBO: createFBO([blurB]),
+    thickFBO: createFBO([thick]),
+    textures: [sceneColor, depthTex, waterDepth, blurA, blurB, thick],
+    fbos: [],
+  };
+  RT.fbos = [RT.sceneFBO, RT.waterFBO, RT.blurAFBO, RT.blurBFBO, RT.thickFBO];
+}
 
 // ---------------------------------------------------------------------------
 // Simulation step
@@ -316,20 +371,17 @@ canvas.addEventListener('wheel', (e) => {
 }, { passive: false });
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
+  if (e.code === 'KeyF') renderMode = renderMode === 'ssf' ? 'points' : 'ssf';
 });
+
+let renderMode = params.get('r') === 'points' ? 'points' : 'ssf';
 
 const FOV = 0.9;
 const LIGHT = normalize3([0.5, 0.8, 0.3]);
 
 function render() {
   const w = canvas.width, h = canvas.height;
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.viewport(0, 0, w, h);
-  gl.clearColor(0.01, 0.015, 0.02, 1);
-  gl.clearDepth(1);
-  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-  gl.enable(gl.DEPTH_TEST);
-  gl.depthFunc(gl.LESS);
+  if (!RT || RT.w !== w || RT.h !== h) createTargets(w, h);
 
   const eye = [
     cam.target[0] + cam.dist * Math.cos(cam.el) * Math.cos(cam.az),
@@ -340,8 +392,20 @@ function render() {
   const proj = perspective(FOV, aspect, 0.05, 20);
   const { view, right, up, fwd } = lookAt(eye, cam.target, [0, 1, 0]);
   const pv = mul4(proj, view);
+  const lightV = normalize3([
+    view[0] * LIGHT[0] + view[4] * LIGHT[1] + view[8] * LIGHT[2],
+    view[1] * LIGHT[0] + view[5] * LIGHT[1] + view[9] * LIGHT[2],
+    view[2] * LIGHT[0] + view[6] * LIGHT[1] + view[10] * LIGHT[2],
+  ]);
 
-  // background: cube walls + rocks
+  // 1. scene (cube walls + rocks) into offscreen color + depth
+  gl.bindFramebuffer(gl.FRAMEBUFFER, RT.sceneFBO);
+  gl.viewport(0, 0, w, h);
+  gl.clearColor(0.01, 0.015, 0.02, 1);
+  gl.clearDepth(1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LESS);
   gl.useProgram(progBG);
   gl.uniform3fv(u(progBG, 'uCamPos'), eye);
   gl.uniform3fv(u(progBG, 'uCamR'), right);
@@ -354,20 +418,83 @@ function render() {
   gl.uniform3fv(u(progBG, 'uLightW'), LIGHT);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-  // water particles
-  const lightV = [
-    view[0] * LIGHT[0] + view[4] * LIGHT[1] + view[8] * LIGHT[2],
-    view[1] * LIGHT[0] + view[5] * LIGHT[1] + view[9] * LIGHT[2],
-    view[2] * LIGHT[0] + view[6] * LIGHT[1] + view[10] * LIGHT[2],
-  ];
-  gl.useProgram(progPoints);
-  bindTex(0, cur.pos, progPoints, 'uPos');
-  bindTex(1, cur.vel, progPoints, 'uVel');
-  gl.uniformMatrix4fv(u(progPoints, 'uProj'), false, proj);
-  gl.uniformMatrix4fv(u(progPoints, 'uView'), false, view);
-  gl.uniform1f(u(progPoints, 'uPointScale'), h * proj[5]);
-  gl.uniform3fv(u(progPoints, 'uLightV'), normalize3(lightV));
+  if (renderMode === 'points') {
+    // Legacy view: shaded impostors straight into the scene, then blit.
+    gl.useProgram(progPoints);
+    bindTex(0, cur.pos, progPoints, 'uPos');
+    bindTex(1, cur.vel, progPoints, 'uVel');
+    gl.uniformMatrix4fv(u(progPoints, 'uProj'), false, proj);
+    gl.uniformMatrix4fv(u(progPoints, 'uView'), false, view);
+    gl.uniform1f(u(progPoints, 'uPointScale'), h * proj[5]);
+    gl.uniform3fv(u(progPoints, 'uLightV'), lightV);
+    gl.drawArrays(gl.POINTS, 0, N);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, w, h);
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(progBlit);
+    bindTex(0, RT.sceneColor, progBlit, 'uScene');
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    return;
+  }
+
+  // 2. water surface depth (z-tested against the shared scene depth)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, RT.waterFBO);
+  gl.clearColor(0, 0, 0, 0); // 0 = no water
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(progPointDepth);
+  bindTex(0, cur.pos, progPointDepth, 'uPos');
+  bindTex(1, cur.vel, progPointDepth, 'uVel');
+  gl.uniformMatrix4fv(u(progPointDepth, 'uProj'), false, proj);
+  gl.uniformMatrix4fv(u(progPointDepth, 'uView'), false, view);
+  gl.uniform1f(u(progPointDepth, 'uPointScale'), h * proj[5]);
   gl.drawArrays(gl.POINTS, 0, N);
+  gl.disable(gl.DEPTH_TEST);
+
+  // 3. depth-aware separable blur, two iterations
+  const scalePx = h * proj[5];
+  let src = RT.waterDepth;
+  for (const [fbo, tex, dx, dy] of [
+    [RT.blurAFBO, RT.blurA, 1, 0], [RT.blurBFBO, RT.blurB, 0, 1],
+    [RT.blurAFBO, RT.blurA, 1, 0], [RT.blurBFBO, RT.blurB, 0, 1],
+  ]) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.useProgram(progBlur);
+    bindTex(0, src, progBlur, 'uDepth');
+    gl.uniform2f(u(progBlur, 'uDir'), dx, dy);
+    gl.uniform1f(u(progBlur, 'uScalePx'), scalePx);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    src = tex;
+  }
+
+  // 4. thickness + foam, half resolution, additive
+  gl.bindFramebuffer(gl.FRAMEBUFFER, RT.thickFBO);
+  gl.viewport(0, 0, RT.hw, RT.hh);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE);
+  gl.useProgram(progThick);
+  bindTex(0, cur.pos, progThick, 'uPos');
+  bindTex(1, cur.vel, progThick, 'uVel');
+  gl.uniformMatrix4fv(u(progThick, 'uProj'), false, proj);
+  gl.uniformMatrix4fv(u(progThick, 'uView'), false, view);
+  gl.uniform1f(u(progThick, 'uPointScale'), RT.hh * proj[5]);
+  gl.drawArrays(gl.POINTS, 0, N);
+  gl.disable(gl.BLEND);
+
+  // 5. composite to the canvas
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, w, h);
+  gl.useProgram(progComposite);
+  bindTex(0, RT.sceneColor, progComposite, 'uScene');
+  bindTex(1, src, progComposite, 'uDepthS');
+  bindTex(2, RT.thick, progComposite, 'uThick');
+  gl.uniform2f(u(progComposite, 'uRes'), w, h);
+  gl.uniform1f(u(progComposite, 'uTanF'), Math.tan(FOV / 2));
+  gl.uniform1f(u(progComposite, 'uAspect'), aspect);
+  gl.uniform3fv(u(progComposite, 'uLightV'), lightV);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -418,7 +545,7 @@ function tick(now) {
   if (now - lastFps > 500) {
     const fps = (frames * 1000) / (now - lastFps);
     statsEl.textContent =
-      `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · 64³ grid · ${SUBSTEPS} substeps` +
+      `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · 64³ grid · ${SUBSTEPS} substeps · ${renderMode}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;
