@@ -12,6 +12,13 @@ import { makeWGSL } from './wgsl.js';
 
 const NROCK = ROCKS.length;
 
+// Volume renderer offscreen scale (?rscale=, default 0.5 — the raymarch is
+// heavy at full resolution; the low-res target is load-bearing).
+function renderScale() {
+  const v = parseFloat(new URLSearchParams(location.search).get('rscale') || '0.5');
+  return v >= 0.1 && v <= 1 ? v : 0.5;
+}
+
 export async function createBackend({ canvas, fail }) {
   if (!navigator.gpu) fail('WebGPU is not available in this browser.');
   const adapter = await navigator.gpu.requestAdapter();
@@ -91,11 +98,35 @@ export async function createBackend({ canvas, fail }) {
       { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
     ],
   });
+  // Volume renderer: grid box blur (compute), raymarch (density buffer
+  // read-only in a fragment stage), and the upscale blit.
+  const volBlurLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    ],
+  });
+  const volLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    ],
+  });
+  const volUpLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+    ],
+  });
   const simPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
   const renderPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [renderLayout] });
   const thickPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [thickLayout] });
   const blurPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [blurLayout] });
   const compPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [compLayout] });
+  const volBlurPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volBlurLayout] });
+  const volPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volLayout] });
+  const volUpPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volUpLayout] });
+  const RSCALE = renderScale();
 
   const alphaBlend = {
     color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -112,12 +143,14 @@ export async function createBackend({ canvas, fail }) {
 
   let cfg = null;
   let NCELL = 0;
-  let bufPos, bufVel, bufC, bufAux, bufGridA, bufGridV, bufSimU;
+  let bufPos, bufVel, bufC, bufAux, bufGridA, bufGridV, bufSimU, bufVolDens;
   let simPipes = null;
   let simBG = null;
   let pipes = null;
   let renderBGGroup = null;
   let thickBGGroup = null;
+  let volBlurBG = null;
+  let volBG = null;
   let substepCount = 0;
   let simBuffers = [];
 
@@ -140,6 +173,9 @@ export async function createBackend({ canvas, fail }) {
     const renderModule = device.createShaderModule({ code: S.render });
     const blurModule = device.createShaderModule({ code: S.blur });
     const compModule = device.createShaderModule({ code: S.composite });
+    const volBlurModule = device.createShaderModule({ code: S.volBlur });
+    const volModule = device.createShaderModule({ code: S.volume });
+    const volUpModule = device.createShaderModule({ code: S.volUpscale });
 
     const ST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     bufPos = buf(cfg.N * 16, ST | GPUBufferUsage.COPY_SRC, cfg.initialData);
@@ -149,7 +185,8 @@ export async function createBackend({ canvas, fail }) {
     bufGridA = buf(NCELL * 16, ST);
     bufGridV = buf(NCELL * 16, ST);
     bufSimU = buf(144, UNI);
-    simBuffers = [bufPos, bufVel, bufC, bufAux, bufGridA, bufGridV, bufSimU];
+    bufVolDens = buf(NCELL * 8, GPUBufferUsage.STORAGE); // blurred (mass, |momentum|)
+    simBuffers = [bufPos, bufVel, bufC, bufAux, bufGridA, bufGridV, bufSimU, bufVolDens];
 
     const cp = (entryPoint) => device.createComputePipeline({
       layout: simPipeLayout, compute: { module: simModule, entryPoint },
@@ -226,7 +263,38 @@ export async function createBackend({ canvas, fail }) {
         fragment: { module: compModule, entryPoint: 'fsComposite', targets: [{ format }] },
         primitive: { topology: 'triangle-list' },
       }),
+      volBlur: device.createComputePipeline({
+        layout: volBlurPipeLayout,
+        compute: { module: volBlurModule, entryPoint: 'blurGrid' },
+      }),
+      volume: device.createRenderPipeline({
+        layout: volPipeLayout,
+        vertex: { module: volModule, entryPoint: 'vsFull' },
+        fragment: { module: volModule, entryPoint: 'fsVolume', targets: [{ format: 'rgba8unorm' }] },
+        primitive: { topology: 'triangle-list' },
+      }),
+      volUp: device.createRenderPipeline({
+        layout: volUpPipeLayout,
+        vertex: { module: volUpModule, entryPoint: 'vsFull' },
+        fragment: { module: volUpModule, entryPoint: 'fsUpscale', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+      }),
     };
+
+    volBlurBG = device.createBindGroup({
+      layout: volBlurLayout,
+      entries: [
+        { binding: 0, resource: { buffer: bufGridV } },
+        { binding: 1, resource: { buffer: bufVolDens } },
+      ],
+    });
+    volBG = device.createBindGroup({
+      layout: volLayout,
+      entries: [
+        { binding: 0, resource: { buffer: bufRenderU } },
+        { binding: 1, resource: { buffer: bufVolDens } },
+      ],
+    });
 
     makeRenderBG();
     substepCount = 0;
@@ -309,6 +377,9 @@ export async function createBackend({ canvas, fail }) {
     const blurA = tex('r32float', w, h);
     const blurB = tex('r32float', w, h);
     const thick = tex('rgba16float', hw, hh);
+    const volW = Math.max(1, Math.round(w * RSCALE));
+    const volH = Math.max(1, Math.round(h * RSCALE));
+    const volColor = tex('rgba8unorm', volW, volH);
 
     const v = {
       sceneColor: sceneColor.createView(),
@@ -317,6 +388,7 @@ export async function createBackend({ canvas, fail }) {
       blurA: blurA.createView(),
       blurB: blurB.createView(),
       thick: thick.createView(),
+      volColor: volColor.createView(),
     };
     const blurBG = (view, ubuf) => device.createBindGroup({
       layout: blurLayout,
@@ -326,8 +398,8 @@ export async function createBackend({ canvas, fail }) {
       ],
     });
     RT = {
-      w, h, v,
-      textures: [sceneColor, sceneDepth, waterDepth, blurA, blurB, thick],
+      w, h, v, volW, volH,
+      textures: [sceneColor, sceneDepth, waterDepth, blurA, blurB, thick, volColor],
       blurBGs: [blurBG(v.waterDepth, bufBlurX), blurBG(v.blurA, bufBlurY), blurBG(v.blurB, bufBlurX)],
       compBG: device.createBindGroup({
         layout: compLayout,
@@ -337,6 +409,13 @@ export async function createBackend({ canvas, fail }) {
           { binding: 2, resource: linSamp },
           { binding: 3, resource: v.blurB },
           { binding: 4, resource: v.thick },
+        ],
+      }),
+      volUpBG: device.createBindGroup({
+        layout: volUpLayout,
+        entries: [
+          { binding: 0, resource: v.volColor },
+          { binding: 1, resource: linSamp },
         ],
       }),
     };
@@ -355,7 +434,7 @@ export async function createBackend({ canvas, fail }) {
     f.set(frame.lightW, 64);
     f.set(frame.lightV, 68);
     f.set([frame.w, frame.h, frame.tanF, frame.aspect], 72);
-    f.set([frame.h * frame.proj[5], Math.ceil(frame.h / 2) * frame.proj[5], 0, 0], 76);
+    f.set([frame.h * frame.proj[5], Math.ceil(frame.h / 2) * frame.proj[5], RT.volW, RT.volH], 76);
     f.set(cfg.rockData, 80);
     const g = frame.gizmo;
     f.set(g ? [...g.a, 1, ...g.b, g.r, 0, 0, 0, 0] : new Array(12).fill(0), 80 + NROCK * 4);
@@ -372,6 +451,39 @@ export async function createBackend({ canvas, fail }) {
     const enc = device.createCommandEncoder();
     const canvasView = context.getCurrentTexture().createView();
     const clearCol = { r: 0.01, g: 0.015, b: 0.02, a: 1 };
+
+    if (frame.mode === 'volume') {
+      // Volumetric raymarch: box-blur the grid density (compute), raymarch
+      // it into a scaled offscreen target, then upscale to the canvas.
+      const cpass = enc.beginComputePass();
+      cpass.setPipeline(pipes.volBlur);
+      cpass.setBindGroup(0, volBlurBG);
+      cpass.dispatchWorkgroups(Math.ceil(NCELL / 64));
+      cpass.end();
+
+      let pass = enc.beginRenderPass({
+        colorAttachments: [{ view: RT.v.volColor, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
+      });
+      pass.setPipeline(pipes.volume);
+      pass.setBindGroup(0, volBG);
+      pass.draw(3);
+      pass.end();
+
+      pass = enc.beginRenderPass({
+        colorAttachments: [{ view: canvasView, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
+      });
+      pass.setPipeline(pipes.volUp);
+      pass.setBindGroup(0, RT.volUpBG);
+      pass.draw(3);
+      if (frame.gizmo) {
+        pass.setPipeline(pipes.gizmo);
+        pass.setBindGroup(0, renderBGGroup);
+        pass.draw(130);
+      }
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      return;
+    }
 
     if (frame.mode === 'points') {
       // Legacy view: background + shaded impostors straight to the canvas.

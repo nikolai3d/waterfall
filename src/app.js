@@ -341,7 +341,7 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-let renderMode = params.get('r') === 'points' ? 'points' : 'ssf';
+let renderMode = ['points', 'ssf', 'volume'].includes(params.get('r')) ? params.get('r') : 'ssf';
 
 // Resolution panel: changing a value rebuilds the whole sim in place
 // (camera and pause state survive); the URL stays shareable.

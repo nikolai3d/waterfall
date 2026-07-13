@@ -79,6 +79,14 @@ ones, and the thickness pass culls water well behind the visible surface
 through the stream in front of it nor punches fake holes around it.
 Press **f** (or `?r=points`) for the raw shaded-particle view.
 
+`?r=volume` instead raymarches the simulation's own density grid as a true
+3D volume: a fragment shader marches the (box-blurred) grid mass to an
+iso-surface, refines the hit by bisection, shades with a density-gradient
+normal, then follows one refracted ray through the interior — integrating
+Beer–Lambert absorption from the marched density — to the analytic
+walls-and-rocks background, with foam from the grid's momentum magnitude;
+it renders at a reduced resolution (`?rscale=`, default 0.5) and upscales.
+
 ## URL parameters
 
 | param  | default    | meaning                                            |
@@ -88,7 +96,8 @@ Press **f** (or `?r=points`) for the raw shaded-particle view.
 | `s`    | `g` / 32   | simulation substeps per frame                      |
 | `l`    | 2600       | particle lifetime in substeps (spout recycling)    |
 | `warm` | 0          | substeps to pre-simulate before the first frame    |
-| `r`    | `ssf`      | rendering: `ssf` (water surface) or `points`       |
+| `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume` |
+| `rscale`| 0.5       | offscreen target scale for `r=volume` (0.1–1)      |
 | `api`  | auto       | backend: `webgpu` or `webgl2` (auto-detects)       |
 | `bench`| off        | time N frames after warmup, then freeze + report   |
 | `dbg`  | off        | overlay with GPU-readback particle statistics      |
