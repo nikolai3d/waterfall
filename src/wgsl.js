@@ -6,6 +6,7 @@
 // updated in place. All constants are baked per config like the GLSL header.
 
 import { ROCKS, THICK_MUL, ANISO_AGE } from './shaders.js';
+import { MC_ROW, MC_CAP } from './mctables.js';
 
 export function makeWGSL(opts) {
   const { GRID, LIFE, N, ISO, K } = opts; // ISO/K validated/defaulted in app.js
@@ -952,27 +953,11 @@ fn blurGrid(@builtin(global_invocation_id) gid: vec3u) {
 }
 `;
 
-  // Fragment raymarch of the blurred density grid: iso-surface hit with
-  // bisection refine, gradient normal, one refraction segment with
-  // Beer-Lambert absorption from the marched interior density, and the
-  // analytic scene (walls + rocks) continued along the refracted ray.
-  // Renders into a scaled offscreen target (see misc.zw), upscaled after.
-  const volume = common + renderUStruct + sceneShade + `
-@group(0) @binding(0) var<uniform> R: RenderU;
-@group(0) @binding(1) var<storage, read> dens: array<vec2f>; // blurred (mass, |momentum|)
-
-const ISO: f32 = 0.5;            // iso-surface threshold, particles/cell
-const STEP: f32 = ${(1 / GRID).toFixed(6)};  // 0.5 grid cells, world units
-const MAXIT: i32 = ${Math.ceil(3.5 * GRID)}; // covers the cube diagonal
-const STEP2: f32 = ${(2 / GRID).toFixed(6)}; // interior absorption step
-const MAXIT2: i32 = ${2 * GRID};
+  // Shared by the volume/voxel and mesh render modules: the water absorption
+  // constant and trilinear sampling of the blurred (mass, |momentum|) grid.
+  // Including modules must declare `dens: array<vec2f>` (any binding slot).
+  const densSample = `
 const ABSORB: vec3f = vec3f(2.6, 1.0, 0.55);
-
-@vertex
-fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
-  let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
-  return vec4f(p * 2.0 - vec2f(1.0), 0.0, 1.0);
-}
 
 // Trilinear sample of the blurred (mass, |momentum|) grid at a world point.
 fn sampleD(p: vec3f) -> vec2f {
@@ -987,15 +972,11 @@ fn sampleD(p: vec3f) -> vec2f {
 }
 
 fn density(p: vec3f) -> f32 { return sampleD(p).x; }
+`;
 
-fn gradD(p: vec3f) -> vec3f {
-  let h = 2.0 / GRIDF; // one cell
-  return vec3f(
-    density(p + vec3f(h, 0.0, 0.0)) - density(p - vec3f(h, 0.0, 0.0)),
-    density(p + vec3f(0.0, h, 0.0)) - density(p - vec3f(0.0, h, 0.0)),
-    density(p + vec3f(0.0, 0.0, h)) - density(p - vec3f(0.0, 0.0, h)));
-}
-
+  // Analytic scene continuation ray, shared the same way (needs R: RenderU
+  // and sceneShade in the including module).
+  const sceneTrace = `
 // Analytic scene (walls + rocks) for a ray starting inside the cube:
 // trimmed copy of fsBackground. Returns rgb + hit distance.
 fn traceScene(ro: vec3f, rd: vec3f) -> vec4f {
@@ -1037,7 +1018,37 @@ fn traceScene(ro: vec3f, rd: vec3f) -> vec4f {
   }
   return vec4f(col, tHit);
 }
+`;
 
+  // Fragment raymarch of the blurred density grid: iso-surface hit with
+  // bisection refine, gradient normal, one refraction segment with
+  // Beer-Lambert absorption from the marched interior density, and the
+  // analytic scene (walls + rocks) continued along the refracted ray.
+  // Renders into a scaled offscreen target (see misc.zw), upscaled after.
+  const volume = common + renderUStruct + sceneShade + `
+@group(0) @binding(0) var<uniform> R: RenderU;
+@group(0) @binding(1) var<storage, read> dens: array<vec2f>; // blurred (mass, |momentum|)
+
+const ISO: f32 = 0.5;            // iso-surface threshold, particles/cell
+const STEP: f32 = ${(1 / GRID).toFixed(6)};  // 0.5 grid cells, world units
+const MAXIT: i32 = ${Math.ceil(3.5 * GRID)}; // covers the cube diagonal
+const STEP2: f32 = ${(2 / GRID).toFixed(6)}; // interior absorption step
+const MAXIT2: i32 = ${2 * GRID};
+
+@vertex
+fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+  return vec4f(p * 2.0 - vec2f(1.0), 0.0, 1.0);
+}
+
+fn gradD(p: vec3f) -> vec3f {
+  let h = 2.0 / GRIDF; // one cell
+  return vec3f(
+    density(p + vec3f(h, 0.0, 0.0)) - density(p - vec3f(h, 0.0, 0.0)),
+    density(p + vec3f(0.0, h, 0.0)) - density(p - vec3f(0.0, h, 0.0)),
+    density(p + vec3f(0.0, 0.0, h)) - density(p - vec3f(0.0, 0.0, h)));
+}
+` + densSample + sceneTrace + `
 // Shared fsVolume/fsVoxel prologue: camera ray from the fragment coord,
 // slab test against the wall cube (miss = dark backdrop), entry point,
 // and entry-face normal.
@@ -1284,6 +1295,173 @@ fn fsVoxel(@builtin(position) frag: vec4f) -> @location(0) vec4f {
 }
 `;
 
+  // --- Marching-cubes isosurface mesh (r=mesh, WebGPU only) -----------------
+
+  // Emit kernel: one thread per cell computes the MC case from the 8 corners
+  // of the blurred density (same ?iso= threshold as the voxel renderer),
+  // reserves output slots with one atomicAdd on the indirect args' vertex
+  // count (the issue's sanctioned simpler variant — no prefix-sum scan;
+  // triangle order across cells is arbitrary, which is fine for an opaque
+  // surface), and writes edge-interpolated vertices with density-gradient
+  // normals into a capped vertex pool. mcArgs doubles as the drawIndirect
+  // buffer; mcFinalize clamps its vertex count to the pool cap (overflowing
+  // cells skip whole triangles past the cap, so no partial triangles).
+  const mcCompute = common + `
+const MISO: f32 = ${ISO.toFixed(4)};   // iso threshold (?iso=, shared with voxel)
+const MCCAP: u32 = ${MC_CAP}u;         // vertex pool cap
+const MCROW: i32 = ${MC_ROW};          // triangle-table row stride
+const WB: f32 = ${(1 - 4 / GRID).toFixed(6)}; // wall extent, world units
+
+@group(0) @binding(0) var<storage, read> dens: array<vec2f>;  // blurred (mass, |momentum|)
+@group(0) @binding(1) var<storage, read> tri: array<i32>;     // MC triangle table
+@group(0) @binding(2) var<storage, read_write> mverts: array<vec4f>; // pos, normal pairs
+@group(0) @binding(3) var<storage, read_write> mcArgs: array<atomic<u32>>; // indirect draw args
+
+// Trilinear density in grid-lattice coordinates (bounds-clamped like sampleD).
+fn densG(p: vec3f) -> f32 {
+  let g = clamp(p, vec3f(0.0), vec3f(GRIDF - 1.001));
+  let b = vec3i(floor(g));
+  let f = g - floor(g);
+  let c00 = mix(dens[cellIndex(b)].x, dens[cellIndex(b + vec3i(1, 0, 0))].x, f.x);
+  let c10 = mix(dens[cellIndex(b + vec3i(0, 1, 0))].x, dens[cellIndex(b + vec3i(1, 1, 0))].x, f.x);
+  let c01 = mix(dens[cellIndex(b + vec3i(0, 0, 1))].x, dens[cellIndex(b + vec3i(1, 0, 1))].x, f.x);
+  let c11 = mix(dens[cellIndex(b + vec3i(0, 1, 1))].x, dens[cellIndex(b + vec3i(1, 1, 1))].x, f.x);
+  return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z);
+}
+
+fn gradG(p: vec3f) -> vec3f {
+  let h = 1.0; // one cell
+  return vec3f(
+    densG(p + vec3f(h, 0.0, 0.0)) - densG(p - vec3f(h, 0.0, 0.0)),
+    densG(p + vec3f(0.0, h, 0.0)) - densG(p - vec3f(0.0, h, 0.0)),
+    densG(p + vec3f(0.0, 0.0, h)) - densG(p - vec3f(0.0, 0.0, h)));
+}
+
+@compute @workgroup_size(64)
+fn mcEmit(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= NCELL) { return; }
+  let gi = i32(i);
+  let cell = vec3i(gi % GRIDI, (gi / GRIDI) % GRIDI, gi / (GRIDI * GRIDI));
+  // Cubes span lattice [cell, cell+1]; +boundary threads have no cube.
+  if (cell.x >= GRIDI - 1 || cell.y >= GRIDI - 1 || cell.z >= GRIDI - 1) { return; }
+
+  // Corner/edge numbering must match the generator in src/mctables.js.
+  // (var, not let/const: dynamically indexed below.)
+  var CO = array<vec3i, 8>(
+    vec3i(0, 0, 0), vec3i(1, 0, 0), vec3i(1, 1, 0), vec3i(0, 1, 0),
+    vec3i(0, 0, 1), vec3i(1, 0, 1), vec3i(1, 1, 1), vec3i(0, 1, 1));
+  var EA = array<i32, 12>(0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3);
+  var EB = array<i32, 12>(1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7);
+
+  var d: array<f32, 8>;
+  var cidx = 0u;
+  for (var c = 0; c < 8; c++) {
+    d[c] = dens[cellIndex(cell + CO[c])].x;
+    if (d[c] >= MISO) { cidx |= (1u << u32(c)); }
+  }
+  if (cidx == 0u || cidx == 255u) { return; }
+
+  let row = i32(cidx) * MCROW;
+  var ntri = 0;
+  for (var t = 0; t < MCROW / 3; t++) {
+    if (tri[row + t * 3] < 0) { break; }
+    ntri++;
+  }
+  if (ntri == 0) { return; }
+
+  let base = atomicAdd(&mcArgs[0], u32(ntri * 3));
+  for (var t = 0; t < ntri; t++) {
+    if (base + u32(t * 3 + 3) > MCCAP) { break; } // pool full: drop whole tris
+    for (var k = 0; k < 3; k++) {
+      let e = tri[row + t * 3 + k];
+      let a = EA[e];
+      let b = EB[e];
+      var mu = 0.5;
+      if (abs(d[b] - d[a]) > 1e-6) { mu = clamp((MISO - d[a]) / (d[b] - d[a]), 0.0, 1.0); }
+      let pg = vec3f(cell + CO[a]) + mu * vec3f(CO[b] - CO[a]);
+      // World position, clamped to the walls so blur bleed past the
+      // boundary cells can't poke the surface through the cube.
+      let wp = clamp(pg * (2.0 / GRIDF) - vec3f(1.0), vec3f(-WB), vec3f(WB));
+      let nrm = normalize(-gradG(pg) + vec3f(1e-6, 0.0, 0.0)); // outward
+      let slot = base + u32(t * 3 + k);
+      mverts[slot * 2u] = vec4f(wp, 1.0);
+      mverts[slot * 2u + 1u] = vec4f(nrm, 0.0);
+    }
+  }
+}
+
+// Clamp the (possibly overflowed) vertex count to the pool cap; the rest of
+// the indirect args (instanceCount = 1, offsets 0) come from the JS reset.
+@compute @workgroup_size(1)
+fn mcFinalize() {
+  let n = atomicLoad(&mcArgs[0]);
+  atomicStore(&mcArgs[0], min(n, MCCAP));
+}
+`;
+
+  // Mesh render module: vertex pulling from the pool (no vertex buffers),
+  // depth-tested into the same pass as the raytraced background, shaded as a
+  // glassy surface: Fresnel over the analytic scene continued along one
+  // refracted ray (no texture feedback), Beer-Lambert from a few interior
+  // density taps, foam from the grid's momentum magnitude at the surface.
+  const mesh = common + renderUStruct + `
+@group(0) @binding(0) var<uniform> R: RenderU;
+@group(0) @binding(1) var<storage, read> mverts: array<vec4f>;
+@group(0) @binding(2) var<storage, read> dens: array<vec2f>;
+` + sceneShade + densSample + sceneTrace + `
+struct MeshVSOut {
+  @builtin(position) pos: vec4f,
+  @location(0) wp: vec3f,
+  @location(1) nrm: vec3f,
+};
+
+@vertex
+fn vsMesh(@builtin(vertex_index) vi: u32) -> MeshVSOut {
+  var o: MeshVSOut;
+  let p = mverts[vi * 2u].xyz;
+  o.pos = R.pv * vec4f(p, 1.0);
+  o.wp = p;
+  o.nrm = mverts[vi * 2u + 1u].xyz;
+  return o;
+}
+
+@fragment
+fn fsMesh(v: MeshVSOut) -> @location(0) vec4f {
+  let e = normalize(R.camPos.xyz - v.wp);
+  var n = normalize(v.nrm);
+  if (dot(n, e) < 0.0) { n = -n; } // two-sided: face the viewer
+
+  // Refract; on total internal reflection fall back to reflection.
+  var rd2 = refract(-e, n, 0.752); // 1 / 1.33
+  if (dot(rd2, rd2) < 1e-6) { rd2 = reflect(-e, n); }
+  rd2 = normalize(rd2);
+
+  // Analytic background along the refracted ray, Beer-Lambert-attenuated
+  // by a few interior density taps (cheap stand-in for a full march).
+  let sc2 = traceScene(v.wp, rd2);
+  var th = 0.0;
+  let dt = sc2.w / 6.0;
+  for (var i = 0; i < 6; i++) {
+    th += sampleD(v.wp + rd2 * ((f32(i) + 0.5) * dt)).x / REST * dt;
+  }
+  var col = sc2.rgb * exp(ABSORB * (-6.0 * th));
+  col += vec3f(0.04, 0.16, 0.24) * (1.0 - exp(-th * 12.0)); // in-scatter
+
+  let fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, e), 0.0), 5.0);
+  col = mix(col, vec3f(0.35, 0.50, 0.60), fres * 0.8);
+  let hv = normalize(R.lightW.xyz + e);
+  col += vec3f(0.9) * pow(max(dot(n, hv), 0.0), 120.0);
+
+  // Foam from the blurred momentum magnitude at the surface.
+  let sd = sampleD(v.wp);
+  let speed = sd.y / max(sd.x, 1e-4) / VMAX;
+  let foam = smoothstep(0.45, 0.9, speed);
+  col = mix(col, vec3f(0.93, 0.97, 1.0), foam * 0.75);
+  return vec4f(col, 1.0);
+}
+`;
+
   // Upscale blit of the scaled volume target to the canvas.
   const volUpscale = `
 struct UpVSOut {
@@ -1317,5 +1495,7 @@ fn fsUpscale(v: UpVSOut) -> @location(0) vec4f {
     volBlur,
     volume,
     volUpscale,
+    mcCompute,
+    mesh,
   };
 }

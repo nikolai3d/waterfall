@@ -360,7 +360,7 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-let renderMode = ['points', 'ssf', 'volume', 'voxel', 'aniso'].includes(params.get('r')) ? params.get('r') : 'ssf';
+let renderMode = ['points', 'ssf', 'volume', 'voxel', 'aniso', 'mesh'].includes(params.get('r')) ? params.get('r') : 'ssf';
 
 // Resolution panel: changing a value rebuilds the whole sim in place
 // (camera and pause state survive); the URL stays shareable.
@@ -511,7 +511,7 @@ function tick(now) {
     statsEl.textContent =
       `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${renderMode}` +
       (renderMode === 'volume' || renderMode === 'voxel' ? ` rscale=${RSCALE}` : '') +
-      (renderMode === 'voxel' ? ` iso=${ISO}` : '') +
+      (renderMode === 'voxel' || renderMode === 'mesh' ? ` iso=${ISO}` : '') +
       (renderMode === 'aniso' ? ` k=${K}` : '') + ` · ${backend.name}` +
       (paused ? ' · paused' : '');
     frames = 0;
