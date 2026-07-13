@@ -88,7 +88,8 @@ depth/thickness fragments intersect the oriented ellipsoid instead of a
 sphere — so thin sheets and streams reconstruct smoothly from far fewer
 visible bumps (most noticeable at low particle counts, e.g. 64³/192²). The
 blur, thickness accumulation, occlusion, and composite stages are shared
-with `ssf` unchanged; `?k=0` reduces exactly to the spherical splats.
+with `ssf` unchanged; `?k=0` reduces to the spherical splats (matching them
+exactly wherever the 1–96 px sprite-size clamp is inactive).
 
 `?r=volume` instead raymarches the simulation's own density grid as a true
 3D volume: a fragment shader marches the (tent-blurred) grid mass to an

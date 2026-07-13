@@ -113,7 +113,7 @@ export async function createBackend({ canvas, fail }) {
   let progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG, progPoints,
     progPointDepth, progThick, progBlur, progComposite, progBlit, progGizmo,
     progVolBlur, progVolume, progVoxel, progVolUpscale,
-    progPointDepthA, progThickA;
+    progPointDepthAniso, progThickAniso;
   let programs = [];
   let cur, nxt, gridA, gridB, gridAFBO, gridBFBO, densTex, densFBO,
     volDens, volDensFBO;
@@ -168,12 +168,12 @@ export async function createBackend({ canvas, fail }) {
     progVolume = compile(S.vsQuad, S.fsVolume, 'volume');
     progVoxel = compile(S.vsQuad, S.fsVoxel, 'voxel');
     progVolUpscale = compile(S.vsQuad, S.fsVolUpscale, 'volUpscale');
-    progPointDepthA = compile(S.vsPointAniso, S.fsPointDepthAniso, 'pointDepthAniso');
-    progThickA = compile(S.vsPointAniso, S.fsThickAniso, 'thicknessAniso');
+    progPointDepthAniso = compile(S.vsPointDepthAniso, S.fsPointDepthAniso, 'pointDepthAniso');
+    progThickAniso = compile(S.vsThickAniso, S.fsThickAniso, 'thicknessAniso');
     programs = [progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG,
       progPoints, progPointDepth, progThick, progBlur, progComposite, progBlit,
       progGizmo, progVolBlur, progVolume, progVoxel, progVolUpscale,
-      progPointDepthA, progThickA];
+      progPointDepthAniso, progThickAniso];
 
     cur = makeParticleSet(cfg.initialData);
     nxt = makeParticleSet(cfg.initialData);
@@ -403,7 +403,7 @@ export async function createBackend({ canvas, fail }) {
     const aniso = frame.mode === 'aniso';
 
     // 2. water surface depth (z-tested against the shared scene depth)
-    const pd = aniso ? progPointDepthA : progPointDepth;
+    const pd = aniso ? progPointDepthAniso : progPointDepth;
     gl.bindFramebuffer(gl.FRAMEBUFFER, RT.waterFBO);
     gl.clearColor(0, 0, 0, 0); // 0 = no water
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -413,7 +413,6 @@ export async function createBackend({ canvas, fail }) {
     gl.uniformMatrix4fv(u(pd, 'uProj'), false, proj);
     gl.uniformMatrix4fv(u(pd, 'uView'), false, view);
     gl.uniform1f(u(pd, 'uPointScale'), h * proj[5]);
-    if (aniso) gl.uniform1f(u(pd, 'uSizeMul'), 1.0);
     gl.drawArrays(gl.POINTS, 0, cfg.N);
     gl.disable(gl.DEPTH_TEST);
 
@@ -440,7 +439,7 @@ export async function createBackend({ canvas, fail }) {
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
-    const tk = aniso ? progThickA : progThick;
+    const tk = aniso ? progThickAniso : progThick;
     gl.useProgram(tk);
     bindTex(0, cur.pos, tk, 'uPos');
     bindTex(1, cur.vel, tk, 'uVel');
@@ -451,7 +450,6 @@ export async function createBackend({ canvas, fail }) {
     gl.uniformMatrix4fv(u(tk, 'uProj'), false, proj);
     gl.uniformMatrix4fv(u(tk, 'uView'), false, view);
     gl.uniform1f(u(tk, 'uPointScale'), RT.hh * proj[5]);
-    if (aniso) gl.uniform1f(u(tk, 'uSizeMul'), 1.7); // THICK_MUL
     gl.drawArrays(gl.POINTS, 0, cfg.N);
     gl.disable(gl.BLEND);
 
