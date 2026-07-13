@@ -17,8 +17,7 @@ export function gridLayout(GRID) {
 }
 
 export function makeShaders(opts) {
-  const { GRID, PTEX, LIFE } = opts;
-  const ISO = opts.ISO ?? 1.5; // voxel renderer density threshold (?iso=)
+  const { GRID, PTEX, LIFE, ISO } = opts; // ISO validated/defaulted in app.js
   const { TILES, GTEX } = gridLayout(GRID);
   const s = GRID / 64;
   const vec3 = (a) => `vec3(${a.map((v) => v.toFixed(2)).join(', ')})`;
@@ -787,6 +786,49 @@ vec4 traceScene(vec3 ro, vec3 rd) {
 }
 `;
 
+  // Shared fsVolume/fsVoxel main() prologue: camera ray from the fragment
+  // coord, slab test against the wall cube (miss = dark backdrop + return),
+  // entry point + capped analytic scene, and entry-face normal n0 (dominant
+  // -rd axis when the camera is inside the cube; only consumed by the voxel
+  // DDA if the eye's cell is already solid).
+  const volPrologue = `
+  vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
+  vec3 rd = normalize(uCamF + uCamR * uv.x * uTanF * uAspect + uCamU * uv.y * uTanF);
+  vec3 ro = uCamPos;
+
+  vec3 inv = 1.0 / rd;
+  vec3 ta = (vec3(-B) - ro) * inv;
+  vec3 tb = (vec3(B) - ro) * inv;
+  vec3 tmin3 = min(ta, tb);
+  vec3 tmax3 = max(ta, tb);
+  float t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
+  float tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+  if (tE < max(t0, 0.0)) { // missed the cube: dark backdrop
+    float g = 1.0 - length(uv) * 0.45;
+    o = vec4(vec3(0.015, 0.02, 0.03) * g, 1.0);
+    return;
+  }
+
+  // Analytic scene hit caps the march (water behind a rock stays behind it).
+  vec3 entry = ro + rd * max(t0, 0.0);
+  vec4 sc = traceScene(entry, rd);
+
+  // Cube entry face; with the camera inside the cube fall back to the
+  // dominant axis of -rd.
+  vec3 n0;
+  if (t0 > 0.0) {
+    if (t0 == tmin3.x)      n0 = vec3(-sign(rd.x), 0.0, 0.0);
+    else if (t0 == tmin3.y) n0 = vec3(0.0, -sign(rd.y), 0.0);
+    else                    n0 = vec3(0.0, 0.0, -sign(rd.z));
+  } else {
+    vec3 ad = abs(rd);
+    if (ad.x > ad.y && ad.x > ad.z) n0 = vec3(-sign(rd.x), 0.0, 0.0);
+    else if (ad.y > ad.z)           n0 = vec3(0.0, -sign(rd.y), 0.0);
+    else                            n0 = vec3(0.0, 0.0, -sign(rd.z));
+  }
+`;
+
   // Fragment raymarch of the blurred density grid: iso-surface hit with
   // bisection refine, gradient normal, one refraction segment with
   // Beer-Lambert absorption from the marched interior density, and the
@@ -832,28 +874,7 @@ vec3 gradD(vec3 p) {
 
 ` + traceSceneGLSL + `
 void main() {
-  vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
-  vec3 rd = normalize(uCamF + uCamR * uv.x * uTanF * uAspect + uCamU * uv.y * uTanF);
-  vec3 ro = uCamPos;
-
-  vec3 inv = 1.0 / rd;
-  vec3 ta = (vec3(-B) - ro) * inv;
-  vec3 tb = (vec3(B) - ro) * inv;
-  vec3 tmin3 = min(ta, tb);
-  vec3 tmax3 = max(ta, tb);
-  float t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
-  float tE = min(min(tmax3.x, tmax3.y), tmax3.z);
-
-  if (tE < max(t0, 0.0)) { // missed the cube: dark backdrop
-    float g = 1.0 - length(uv) * 0.45;
-    o = vec4(vec3(0.015, 0.02, 0.03) * g, 1.0);
-    return;
-  }
-
-  // Analytic scene hit caps the march (water behind a rock stays behind it).
-  vec3 entry = ro + rd * max(t0, 0.0);
-  vec4 sc = traceScene(entry, rd);
-
+` + volPrologue + `
   float tHit = -1.0;
   float t = STEP * hash1(vec3(gl_FragCoord.xy, 0.0)); // dither vs banding
   for (int i = 0; i < MAXIT; i++) {
@@ -938,16 +959,22 @@ vec2 cellDens(ivec3 c) {
 // world->grid scale keeps directions unchanged), capped at tEnd (grid
 // units). Returns the hit t (< 0 = miss) with face normal + cell.
 float voxMarch(vec3 roG, vec3 rd0, float tEnd, vec3 n0, out vec3 nOut, out ivec3 cellOut) {
-  vec3 rd = mix(rd0, vec3(1e-6), lessThan(abs(rd0), vec3(1e-6)));
+  // Degenerate-axis guard preserves the component's sign (sign(0) -> +1)
+  // so near-axis rays still step the right way.
+  vec3 sgn = mix(sign(rd0), vec3(1.0), vec3(equal(rd0, vec3(0.0))));
+  vec3 rd = sgn * max(abs(rd0), vec3(1e-6));
+  // Clamp the entry into the grid so cell and tMax agree on the origin.
+  roG = clamp(roG, vec3(0.0), vec3(GRIDF));
   ivec3 cell = clamp(ivec3(floor(roG)), ivec3(0), ivec3(GRIDI - 1));
-  ivec3 stp = ivec3(sign(rd));
+  ivec3 stp = ivec3(sgn);
   vec3 inv = 1.0 / rd;
   vec3 tDelta = abs(inv);
-  vec3 tMax = (vec3(cell) + max(sign(rd), 0.0) - roG) * inv;
+  vec3 tMax = (vec3(cell) + max(sgn, 0.0) - roG) * inv;
   float t = 0.0;
   vec3 n = n0;
   nOut = n0;
   cellOut = cell;
+  if (tEnd <= 0.0) return -1.0;
   for (int i = 0; i < MAXDDA; i++) {
     if (cellDens(cell).x >= VISO) { nOut = n; cellOut = cell; return t; }
     if (tMax.x < tMax.y && tMax.x < tMax.z) {
@@ -964,12 +991,14 @@ float voxMarch(vec3 roG, vec3 rd0, float tEnd, vec3 n0, out vec3 nOut, out ivec3
 
 // Water path length (world units) through solid (>= VISO) cells along a ray.
 float voxThickness(vec3 roG, vec3 rd0, float tEnd) {
-  vec3 rd = mix(rd0, vec3(1e-6), lessThan(abs(rd0), vec3(1e-6)));
+  vec3 sgn = mix(sign(rd0), vec3(1.0), vec3(equal(rd0, vec3(0.0))));
+  vec3 rd = sgn * max(abs(rd0), vec3(1e-6));
+  roG = clamp(roG, vec3(0.0), vec3(GRIDF));
   ivec3 cell = clamp(ivec3(floor(roG)), ivec3(0), ivec3(GRIDI - 1));
-  ivec3 stp = ivec3(sign(rd));
+  ivec3 stp = ivec3(sgn);
   vec3 inv = 1.0 / rd;
   vec3 tDelta = abs(inv);
-  vec3 tMax = (vec3(cell) + max(sign(rd), 0.0) - roG) * inv;
+  vec3 tMax = (vec3(cell) + max(sgn, 0.0) - roG) * inv;
   float t = 0.0;
   float th = 0.0;
   for (int i = 0; i < MAXDDA; i++) {
@@ -986,36 +1015,7 @@ float voxThickness(vec3 roG, vec3 rd0, float tEnd) {
 }
 
 void main() {
-  vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
-  vec3 rd = normalize(uCamF + uCamR * uv.x * uTanF * uAspect + uCamU * uv.y * uTanF);
-  vec3 ro = uCamPos;
-
-  vec3 inv = 1.0 / rd;
-  vec3 ta = (vec3(-B) - ro) * inv;
-  vec3 tb = (vec3(B) - ro) * inv;
-  vec3 tmin3 = min(ta, tb);
-  vec3 tmax3 = max(ta, tb);
-  float t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
-  float tE = min(min(tmax3.x, tmax3.y), tmax3.z);
-
-  if (tE < max(t0, 0.0)) { // missed the cube: dark backdrop
-    float g = 1.0 - length(uv) * 0.45;
-    o = vec4(vec3(0.015, 0.02, 0.03) * g, 1.0);
-    return;
-  }
-
-  // Analytic scene hit caps the DDA (water behind a rock stays behind it).
-  vec3 entry = ro + rd * max(t0, 0.0);
-  vec4 sc = traceScene(entry, rd);
-
-  // Cube entry face doubles as the first cell's face normal.
-  vec3 n0 = vec3(0.0, 1.0, 0.0); // camera inside the cube: arbitrary
-  if (t0 > 0.0) {
-    if (t0 == tmin3.x)      n0 = vec3(-sign(rd.x), 0.0, 0.0);
-    else if (t0 == tmin3.y) n0 = vec3(0.0, -sign(rd.y), 0.0);
-    else                    n0 = vec3(0.0, 0.0, -sign(rd.z));
-  }
-
+` + volPrologue + `
   float G2 = GRIDF * 0.5;
   vec3 roG = (entry + 1.0) * G2;
   vec3 n;
@@ -1037,8 +1037,8 @@ void main() {
   if (dot(rd2, rd2) < 1e-6) rd2 = reflect(rd, n);
   rd2 = normalize(rd2);
   vec4 sc2 = traceScene(P, rd2);
-  vec3 gp = roG + rd * tHit; // grid-space hit, nudged off the face below
-  float th = voxThickness(gp + rd2 * 0.01, rd2, sc2.w * G2);
+  vec3 gp = roG + rd * tHit; // grid-space hit point
+  float th = voxThickness(gp + rd2 * 0.01, rd2, sc2.w * G2); // nudged off the face
   vec3 bg = sc2.rgb * exp(ABSORB * (-6.0 * th));
   bg += vec3(0.04, 0.16, 0.24) * (1.0 - exp(-th * 9.0)); // in-scatter
 
