@@ -10,8 +10,9 @@
 // Triangle winding is NOT normalized (normals come from the density
 // gradient, and the mesh pipeline does not cull).
 //
-// Corner and edge numbering must match the CO/EA/EB arrays in the mcEmit
-// kernel (src/wgsl.js):
+// Corner and edge numbering (the mcEmit kernel's CO/EA/EB arrays in
+// src/wgsl.js are template-interpolated from the exports below, so JS and
+// WGSL cannot drift):
 //
 //   corners: 0..3 = z=0 ring (0,0,0)(1,0,0)(1,1,0)(0,1,0), 4..7 = z=1 ring
 //   edges:   0..3 = z=0 ring, 4..7 = z=1 ring, 8..11 = verticals c -> c+4
@@ -99,6 +100,44 @@ for (let c = 0; c < 256; c++) {
   maxLen = Math.max(maxLen, t.length);
 }
 
+// Load-time validation (cheap: runs once at import, over 256 tiny rows).
+// Classic MC invariants — a generator bug fails the module import loudly
+// instead of rendering garbage.
+if (maxLen !== 15) {
+  throw new Error(`MC tables: longest case is ${maxLen / 3} triangles, expected 5`);
+}
+{
+  // Case 1 (only corner 0 inside) is one triangle on the corner's three
+  // incident edges {0, 3, 8}.
+  const t1 = [...rows[1]].sort((a, b) => a - b);
+  if (rows[1].length !== 3 || t1.join(',') !== '0,3,8') {
+    throw new Error(`MC tables: case 1 should be one triangle on edges {0,3,8}, got [${rows[1]}]`);
+  }
+}
+// Complementary checks. NOTE: full triangle-count symmetry under c -> 255^c
+// deliberately does NOT hold here — the ambiguous-face rule ("separate the
+// diagonal") is inside/outside-asymmetric, which is exactly what makes the
+// table face-consistent (crack-free); e.g. case 5 (two diagonal corners) is
+// two cap triangles while its complement 250 is a 4-triangle valley. What
+// must hold for every case: the complement crosses the same cut edges; and
+// for cases with no ambiguous face, the same triangle count.
+function hasAmbiguousFace(mask) {
+  return FACES.some((f) => {
+    const bit = f.map((c) => (mask >> c) & 1);
+    return bit.filter((b, i) => b !== bit[(i + 1) & 3]).length === 4;
+  });
+}
+const edgeSet = (t) => [...new Set(t)].sort((a, b) => a - b).join(',');
+for (let c = 0; c < 256; c++) {
+  if (edgeSet(rows[c]) !== edgeSet(rows[255 ^ c])) {
+    throw new Error(`MC tables: case ${c} and complement ${255 ^ c} cut different edges`);
+  }
+  if (!hasAmbiguousFace(c) && rows[c].length !== rows[255 ^ c].length) {
+    throw new Error(
+      `MC tables: unambiguous case ${c} has ${rows[c].length / 3} triangles, complement ${255 ^ c} has ${rows[255 ^ c].length / 3}`);
+  }
+}
+
 // Row stride: longest case plus a -1 terminator.
 export const MC_ROW = maxLen + 1;
 export const MC_TRI = new Int32Array(256 * MC_ROW).fill(-1);
@@ -108,5 +147,6 @@ rows.forEach((t, c) => MC_TRI.set(t, c * MC_ROW));
 // splits a triangle); pos + normal as 2 x vec4f = 32 bytes/vertex -> 48 MB.
 export const MC_CAP = 1500000;
 
-// Corner offsets for the emit kernel, kept here so JS and WGSL can't drift.
+// Corner offsets / edge endpoints for the emit kernel: makeWGSL interpolates
+// these into the WGSL CO/EA/EB array literals, so JS and WGSL can't drift.
 export { CORNERS as MC_CORNERS, EDGES as MC_EDGES };

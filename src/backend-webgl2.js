@@ -497,5 +497,11 @@ export async function createBackend({ canvas, fail }) {
     gl.deleteVertexArray(vao);
   }
 
-  return { name: 'webgl2', init, substep, render, readParticles, dispose };
+  // effectiveMode: what render(frame) actually draws for a selected mode —
+  // r=mesh is WebGPU-only and falls back to the ssf path here, and the app
+  // shell reports that in the stats line (`mesh→ssf`).
+  return {
+    name: 'webgl2', init, substep, render, readParticles, dispose,
+    effectiveMode: (mode) => (mode === 'mesh' ? 'ssf' : mode),
+  };
 }

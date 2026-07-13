@@ -127,7 +127,9 @@ continued along one refracted ray, Beer–Lambert absorption from a few
 interior density taps, and foam from the grid's momentum magnitude at the
 surface. Topology changes frame to frame, so mild temporal popping is
 inherent (the density blur keeps it tame). On WebGL2 the chip stays enabled
-but the mode renders the `ssf` path (with a console note).
+but the mode renders the `ssf` path (with a console note, and the stats line
+reads `mesh→ssf` instead of `mesh`). If the WebGPU backend fails to load and
+the app auto-falls back, the stats line marks it as `webgl2 (fallback)`.
 
 ## URL parameters
 
