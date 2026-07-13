@@ -504,7 +504,8 @@ function tick(now) {
     const fps = (frames * 1000) / (now - lastFps);
     statsEl.textContent =
       `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${renderMode}` +
-      (renderMode === 'volume' || renderMode === 'voxel' ? ` rscale=${RSCALE}` : '') + ` · ${backend.name}` +
+      (renderMode === 'volume' || renderMode === 'voxel' ? ` rscale=${RSCALE}` : '') +
+      (renderMode === 'voxel' ? ` iso=${ISO}` : '') + ` · ${backend.name}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;

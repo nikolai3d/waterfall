@@ -85,7 +85,8 @@ iso-surface, refines the hit by bisection, shades with a density-gradient
 normal, then follows one refracted ray through the interior — integrating
 Beer–Lambert absorption from the marched density — to the analytic
 walls-and-rocks background, with foam from the grid's momentum magnitude;
-it renders at a reduced resolution (`?rscale=`, default 0.5) and upscales.
+it renders at a reduced resolution (`?rscale=`, default 0.5) and upscales;
+its iso threshold is fixed at 0.5 (`?iso=` affects the voxel renderer only).
 
 `?r=voxel` renders that same density grid as literal grid-aligned cubes
 (a deliberately chunky, Minecraft-water look that exposes the simulation's

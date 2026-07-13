@@ -29,11 +29,13 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
   actions behind — trust chips/URL for immediate state, stats only after a
   generous tail delay.
 - `?r=points` exercises the legacy impostor render path; `?r=volume` the
-  grid-density raymarcher (its offscreen target scale is `?rscale=`,
-  default 0.5, valid 0.1–1).
-- The stats line shows the active render mode (and, in volume mode, the
-  effective `rscale=`) — assert on it in harnesses to confirm a mode/param
-  took effect.
+  grid-density raymarcher; `?r=voxel` the grid-aligned-cube DDA renderer.
+  Both volume and voxel render offscreen at `?rscale=` (default 0.5, valid
+  0.1–1). Voxel's solid-cell density threshold is `?iso=` (default 1.5,
+  valid 0.1–16; garbage or out-of-range falls back to the default).
+- The stats line shows the active render mode (and, in volume/voxel modes,
+  the effective `rscale=`; in voxel mode also `iso=`) — assert on it in
+  harnesses to confirm a mode/param took effect.
 - macOS has no `timeout` command.
 
 ## Driving the UI (clicks) headlessly

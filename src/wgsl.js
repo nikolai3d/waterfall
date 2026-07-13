@@ -8,8 +8,7 @@
 import { ROCKS } from './shaders.js';
 
 export function makeWGSL(opts) {
-  const { GRID, LIFE, N } = opts;
-  const ISO = opts.ISO ?? 1.5; // voxel renderer density threshold (?iso=)
+  const { GRID, LIFE, N, ISO } = opts; // ISO validated/defaulted in app.js
   const s = GRID / 64;
   const vec3f = (a) => `vec3f(${a.map((v) => v.toFixed(2)).join(', ')})`;
   const NROCK = ROCKS.length;
@@ -911,12 +910,24 @@ fn traceScene(ro: vec3f, rd: vec3f) -> vec4f {
   return vec4f(col, tHit);
 }
 
-@fragment
-fn fsVolume(@builtin(position) frag: vec4f) -> @location(0) vec4f {
-  var uv = frag.xy / R.misc.zw * 2.0 - vec2f(1.0);
+// Shared fsVolume/fsVoxel prologue: camera ray from the fragment coord,
+// slab test against the wall cube (miss = dark backdrop), entry point,
+// and entry-face normal.
+struct RayStart {
+  miss: bool,
+  bg: vec3f,     // backdrop color, valid only when miss
+  rd: vec3f,
+  entry: vec3f,  // ray/cube entry point (the eye itself when inside)
+  n0: vec3f,     // entry-face normal
+};
+
+fn cubeEnter(frag: vec2f) -> RayStart {
+  var rs: RayStart;
+  var uv = frag / R.misc.zw * 2.0 - vec2f(1.0);
   uv.y = -uv.y; // framebuffer y is top-down in WebGPU
   let rd = normalize(R.camF.xyz + R.camR.xyz * uv.x * R.res.z * R.res.w + R.camU.xyz * uv.y * R.res.z);
   let ro = R.camPos.xyz;
+  rs.rd = rd;
 
   let inv = 1.0 / rd;
   let ta = (vec3f(-B) - ro) * inv;
@@ -926,14 +937,38 @@ fn fsVolume(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
   let tE = min(min(tmax3.x, tmax3.y), tmax3.z);
 
-  if (tE < max(t0, 0.0)) { // missed the cube: dark backdrop
+  rs.miss = tE < max(t0, 0.0);
+  if (rs.miss) { // missed the cube: dark backdrop
     let g = 1.0 - length(uv) * 0.45;
-    return vec4f(vec3f(0.015, 0.02, 0.03) * g, 1.0);
+    rs.bg = vec3f(0.015, 0.02, 0.03) * g;
+    return rs;
   }
 
+  rs.entry = ro + rd * max(t0, 0.0);
+
+  // Cube entry face; with the camera inside the cube fall back to the
+  // dominant axis of -rd (only consumed if the eye's cell is already solid).
+  if (t0 > 0.0) {
+    if (t0 == tmin3.x) { rs.n0 = vec3f(-sign(rd.x), 0.0, 0.0); }
+    else if (t0 == tmin3.y) { rs.n0 = vec3f(0.0, -sign(rd.y), 0.0); }
+    else { rs.n0 = vec3f(0.0, 0.0, -sign(rd.z)); }
+  } else {
+    let a = abs(rd);
+    if (a.x > a.y && a.x > a.z) { rs.n0 = vec3f(-sign(rd.x), 0.0, 0.0); }
+    else if (a.y > a.z) { rs.n0 = vec3f(0.0, -sign(rd.y), 0.0); }
+    else { rs.n0 = vec3f(0.0, 0.0, -sign(rd.z)); }
+  }
+  return rs;
+}
+
+@fragment
+fn fsVolume(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+  let rs = cubeEnter(frag.xy);
+  if (rs.miss) { return vec4f(rs.bg, 1.0); }
+  let rd = rs.rd;
+  let entry = rs.entry;
+
   // Analytic scene hit caps the march (water behind a rock stays behind it).
-  let tS = max(t0, 0.0);
-  let entry = ro + rd * tS;
   let sc = traceScene(entry, rd);
 
   var tHit = -1.0;
@@ -1012,17 +1047,23 @@ struct VoxHit {
 
 // Grid traversal from roG (grid units) along rd (unit direction — uniform
 // world->grid scale keeps directions unchanged), capped at tEnd (grid units).
-fn voxMarch(roG: vec3f, rd0: vec3f, tEnd: f32, n0: vec3f) -> VoxHit {
-  let rd = select(rd0, vec3f(1e-6), abs(rd0) < vec3f(1e-6));
+fn voxMarch(roG0: vec3f, rd0: vec3f, tEnd: f32, n0: vec3f) -> VoxHit {
+  // Degenerate-axis guard preserves the component's sign (sign(0) -> +1)
+  // so near-axis rays still step the right way.
+  let sgn = select(sign(rd0), vec3f(1.0), rd0 == vec3f(0.0));
+  let rd = sgn * max(abs(rd0), vec3f(1e-6));
+  // Clamp the entry into the grid so cell and tMax agree on the origin.
+  let roG = clamp(roG0, vec3f(0.0), vec3f(GRIDF));
   var cell = clamp(vec3i(floor(roG)), vec3i(0), vec3i(GRIDI - 1));
-  let stp = vec3i(sign(rd));
+  let stp = vec3i(sgn);
   let inv = 1.0 / rd;
   let tDelta = abs(inv);
-  var tMax = (vec3f(cell) + max(sign(rd), vec3f(0.0)) - roG) * inv;
+  var tMax = (vec3f(cell) + max(sgn, vec3f(0.0)) - roG) * inv;
   var t = 0.0;
   var n = n0;
   var h: VoxHit;
   h.t = -1.0; h.n = n0; h.cell = cell;
+  if (tEnd <= 0.0) { return h; }
   for (var i = 0; i < MAXDDA; i++) {
     if (cellDens(cell).x >= VISO) { h.t = t; h.n = n; h.cell = cell; return h; }
     if (tMax.x < tMax.y && tMax.x < tMax.z) {
@@ -1038,13 +1079,15 @@ fn voxMarch(roG: vec3f, rd0: vec3f, tEnd: f32, n0: vec3f) -> VoxHit {
 }
 
 // Water path length (world units) through solid (>= VISO) cells along a ray.
-fn voxThickness(roG: vec3f, rd0: vec3f, tEnd: f32) -> f32 {
-  let rd = select(rd0, vec3f(1e-6), abs(rd0) < vec3f(1e-6));
+fn voxThickness(roG0: vec3f, rd0: vec3f, tEnd: f32) -> f32 {
+  let sgn = select(sign(rd0), vec3f(1.0), rd0 == vec3f(0.0));
+  let rd = sgn * max(abs(rd0), vec3f(1e-6));
+  let roG = clamp(roG0, vec3f(0.0), vec3f(GRIDF));
   var cell = clamp(vec3i(floor(roG)), vec3i(0), vec3i(GRIDI - 1));
-  let stp = vec3i(sign(rd));
+  let stp = vec3i(sgn);
   let inv = 1.0 / rd;
   let tDelta = abs(inv);
-  var tMax = (vec3f(cell) + max(sign(rd), vec3f(0.0)) - roG) * inv;
+  var tMax = (vec3f(cell) + max(sgn, vec3f(0.0)) - roG) * inv;
   var t = 0.0;
   var th = 0.0;
   for (var i = 0; i < MAXDDA; i++) {
@@ -1062,39 +1105,17 @@ fn voxThickness(roG: vec3f, rd0: vec3f, tEnd: f32) -> f32 {
 
 @fragment
 fn fsVoxel(@builtin(position) frag: vec4f) -> @location(0) vec4f {
-  var uv = frag.xy / R.misc.zw * 2.0 - vec2f(1.0);
-  uv.y = -uv.y; // framebuffer y is top-down in WebGPU
-  let rd = normalize(R.camF.xyz + R.camR.xyz * uv.x * R.res.z * R.res.w + R.camU.xyz * uv.y * R.res.z);
-  let ro = R.camPos.xyz;
-
-  let inv = 1.0 / rd;
-  let ta = (vec3f(-B) - ro) * inv;
-  let tb = (vec3f(B) - ro) * inv;
-  let tmin3 = min(ta, tb);
-  let tmax3 = max(ta, tb);
-  let t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
-  let tE = min(min(tmax3.x, tmax3.y), tmax3.z);
-
-  if (tE < max(t0, 0.0)) { // missed the cube: dark backdrop
-    let g = 1.0 - length(uv) * 0.45;
-    return vec4f(vec3f(0.015, 0.02, 0.03) * g, 1.0);
-  }
+  let rs = cubeEnter(frag.xy);
+  if (rs.miss) { return vec4f(rs.bg, 1.0); }
+  let rd = rs.rd;
+  let entry = rs.entry;
 
   // Analytic scene hit caps the DDA (water behind a rock stays behind it).
-  let entry = ro + rd * max(t0, 0.0);
   let sc = traceScene(entry, rd);
-
-  // Cube entry face doubles as the first cell's face normal.
-  var n0 = vec3f(0.0, 1.0, 0.0); // camera inside the cube: arbitrary
-  if (t0 > 0.0) {
-    if (t0 == tmin3.x) { n0 = vec3f(-sign(rd.x), 0.0, 0.0); }
-    else if (t0 == tmin3.y) { n0 = vec3f(0.0, -sign(rd.y), 0.0); }
-    else { n0 = vec3f(0.0, 0.0, -sign(rd.z)); }
-  }
 
   let G2 = GRIDF * 0.5;
   let roG = (entry + vec3f(1.0)) * G2;
-  let hit = voxMarch(roG, rd, sc.w * G2, n0);
+  let hit = voxMarch(roG, rd, sc.w * G2, rs.n0);
   if (hit.t < 0.0) { return vec4f(sc.rgb, 1.0); }
 
   let P = entry + rd * (hit.t / G2);
@@ -1112,8 +1133,8 @@ fn fsVoxel(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   if (dot(rd2, rd2) < 1e-6) { rd2 = reflect(rd, n); }
   rd2 = normalize(rd2);
   let sc2 = traceScene(P, rd2);
-  let gp = roG + rd * hit.t; // grid-space hit, nudged off the face below
-  let th = voxThickness(gp + rd2 * 0.01, rd2, sc2.w * G2);
+  let gp = roG + rd * hit.t; // grid-space hit point
+  let th = voxThickness(gp + rd2 * 0.01, rd2, sc2.w * G2); // nudged off the face
   var bg = sc2.rgb * exp(ABSORB * (-6.0 * th));
   bg += vec3f(0.04, 0.16, 0.24) * (1.0 - exp(-th * 9.0)); // in-scatter
 
