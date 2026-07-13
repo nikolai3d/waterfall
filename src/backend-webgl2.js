@@ -12,13 +12,6 @@
 
 import { makeShaders, gridLayout } from './shaders.js';
 
-// Volume renderer offscreen scale (?rscale=, default 0.5 — the raymarch is
-// heavy at full resolution; the low-res target is load-bearing).
-function renderScale() {
-  const v = parseFloat(new URLSearchParams(location.search).get('rscale') || '0.5');
-  return v >= 0.1 && v <= 1 ? v : 0.5;
-}
-
 export async function createBackend({ canvas, fail }) {
   const gl = canvas.getContext('webgl2', { antialias: true, alpha: false, depth: true });
   if (!gl) fail('WebGL2 is not available in this browser.');
@@ -119,12 +112,11 @@ export async function createBackend({ canvas, fail }) {
   let GTEX = 0;
   let progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG, progPoints,
     progPointDepth, progThick, progBlur, progComposite, progBlit, progGizmo,
-    progVolBlur, progVolume, progUpscale;
+    progVolBlur, progVolume, progVolUpscale;
   let programs = [];
   let cur, nxt, gridA, gridB, gridAFBO, gridBFBO, densTex, densFBO,
     volDens, volDensFBO;
   let substepCount = 0;
-  const RSCALE = renderScale();
 
   function makeParticleSet(posData) {
     const pos = createTex(cfg.PTEX, cfg.PTEX, posData);
@@ -173,10 +165,10 @@ export async function createBackend({ canvas, fail }) {
     progGizmo = compile(S.vsGizmo, S.fsGizmo, 'gizmo');
     progVolBlur = compile(S.vsQuad, S.fsVolBlur, 'volBlur');
     progVolume = compile(S.vsQuad, S.fsVolume, 'volume');
-    progUpscale = compile(S.vsQuad, S.fsUpscale, 'upscale');
+    progVolUpscale = compile(S.vsQuad, S.fsVolUpscale, 'volUpscale');
     programs = [progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG,
       progPoints, progPointDepth, progThick, progBlur, progComposite, progBlit,
-      progGizmo, progVolBlur, progVolume, progUpscale];
+      progGizmo, progVolBlur, progVolume, progVolUpscale];
 
     cur = makeParticleSet(cfg.initialData);
     nxt = makeParticleSet(cfg.initialData);
@@ -213,8 +205,8 @@ export async function createBackend({ canvas, fail }) {
     const blurA = createTex(w, h, null, gl.R32F);
     const blurB = createTex(w, h, null, gl.R32F);
     const thick = createTex(hw, hh, null, gl.RGBA16F, gl.LINEAR);
-    const volW = Math.max(1, Math.round(w * RSCALE));
-    const volH = Math.max(1, Math.round(h * RSCALE));
+    const volW = Math.max(1, Math.round(w * cfg.RSCALE));
+    const volH = Math.max(1, Math.round(h * cfg.RSCALE));
     const volColor = createTex(volW, volH, null, gl.RGBA8, gl.LINEAR);
     RT = {
       w, h, hw, hh, volW, volH,
@@ -323,7 +315,7 @@ export async function createBackend({ canvas, fail }) {
     if (!RT || RT.w !== w || RT.h !== h) createTargets(w, h);
 
     if (frame.mode === 'volume') {
-      // Volumetric raymarch: box-blur the grid density, raymarch it into a
+      // Volumetric raymarch: tent-blur the grid density, raymarch it into a
       // scaled offscreen target, then upscale to the canvas.
       gl.disable(gl.DEPTH_TEST);
       gl.bindFramebuffer(gl.FRAMEBUFFER, volDensFBO);
@@ -349,9 +341,9 @@ export async function createBackend({ canvas, fail }) {
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, w, h);
-      gl.useProgram(progUpscale);
-      bindTex(0, RT.volColor, progUpscale, 'uScene');
-      gl.uniform2f(u(progUpscale, 'uRes'), w, h);
+      gl.useProgram(progVolUpscale);
+      bindTex(0, RT.volColor, progVolUpscale, 'uScene');
+      gl.uniform2f(u(progVolUpscale, 'uRes'), w, h);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       drawGizmo(frame);
       return;

@@ -597,17 +597,64 @@ out vec4 o;
 void main() { o = vec4(texelFetch(uScene, ivec2(gl_FragCoord.xy), 0).rgb, 1.0); }
 `;
 
+  // Shared hit-point shading for the analytic scene, appended into BOTH
+  // fsBackground and fsVolume (whose traceScene reuses the same look), so a
+  // wall/rock look tweak is one edit per language (see wgsl.js for WGSL).
+  // Intersection logic stays with each shader.
+  const sceneShade = `
+const float B = ${(1 - 4 / GRID).toFixed(6)}; // wall extent in world units (grid cells 2..GRIDI-2)
+
+// Rock: noise in rock-local coordinates (offset per rock), so the texture
+// is attached to the rock and moves with it when dragged, instead of the
+// rock sliding through a fixed world-space noise volume.
+vec3 shadeRock(vec3 hit, vec3 nrm, vec3 rockC, float rockId, vec3 lightW) {
+  vec3 cell = floor((hit - rockC) * 60.0 + rockId * 23.0);
+  float n1 = hash1(cell);
+  float n2 = hash1(cell + 17.0);
+  float n3 = hash1(cell + 43.0);
+  nrm = normalize(nrm + (vec3(n1, n2, n3) - 0.5) * 0.35);
+  float diff = max(dot(nrm, lightW), 0.0);
+  float ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
+  vec3 base = mix(vec3(0.30, 0.27, 0.24), vec3(0.42, 0.40, 0.37), n1);
+  return base * (0.30 + 0.75 * diff) * ao;
+}
+
+// Wall/floor: base color with subtle grid lines every 8 sim cells and a
+// faint glow along the cube edges.
+vec3 shadeWall(vec3 hit, vec3 lightW) {
+  vec3 a = abs(hit) / B;
+  vec3 n;
+  if (a.x > a.y && a.x > a.z)      n = vec3(-sign(hit.x), 0.0, 0.0);
+  else if (a.y > a.z)              n = vec3(0.0, -sign(hit.y), 0.0);
+  else                             n = vec3(0.0, 0.0, -sign(hit.z));
+  bool isFloor = n.y > 0.5;
+  vec3 base = isFloor ? vec3(0.10, 0.11, 0.125) : vec3(0.065, 0.075, 0.09);
+  float diff = max(dot(n, lightW), 0.0);
+  vec3 col = base * (0.5 + 0.5 * diff);
+
+  vec2 tuv = (abs(n.x) > 0.5) ? hit.yz : (abs(n.y) > 0.5 ? hit.xz : hit.xy);
+  vec2 g2 = abs(fract(tuv * (GRIDF / 16.0)) - 0.5) / (GRIDF / 16.0);
+  float line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
+  col *= mix(1.3, 1.0, line);
+
+  vec3 s = B - abs(hit);
+  float m1 = min(s.x, min(s.y, s.z));
+  float mx = max(s.x, max(s.y, s.z));
+  float mid = s.x + s.y + s.z - m1 - mx;
+  col += vec3(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+  return col;
+}
+`;
+
   // Background: analytic raytrace of the cube interior and rock spheres,
   // writing correct depth so particles composite against it.
-  const fsBackground = header + `
+  const fsBackground = header + sceneShade + `
 uniform vec3 uCamPos, uCamR, uCamU, uCamF;
 uniform vec2 uRes;
 uniform float uTanF, uAspect;
 uniform mat4 uPV;
 uniform vec3 uLightW;
 out vec4 o;
-
-const float B = ${(1 - 4 / GRID).toFixed(6)}; // wall extent in world units (grid cells 2..GRIDI-2)
 
 void main() {
   vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
@@ -655,42 +702,10 @@ void main() {
   vec3 hit, col;
   if (isRock) {
     hit = uCamPos + rd * tR;
-    // Noise in rock-local coordinates (offset per rock), so the texture is
-    // attached to the rock and moves with it when dragged, instead of the
-    // rock sliding through a fixed world-space noise volume.
-    vec3 cell = floor((hit - rockC) * 60.0 + rockId * 23.0);
-    float n1 = hash1(cell);
-    float n2 = hash1(cell + 17.0);
-    float n3 = hash1(cell + 43.0);
-    nrm = normalize(nrm + (vec3(n1, n2, n3) - 0.5) * 0.35);
-    float diff = max(dot(nrm, uLightW), 0.0);
-    float ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
-    vec3 base = mix(vec3(0.30, 0.27, 0.24), vec3(0.42, 0.40, 0.37), n1);
-    col = base * (0.30 + 0.75 * diff) * ao;
+    col = shadeRock(hit, nrm, rockC, rockId, uLightW);
   } else {
     hit = uCamPos + rd * tE; // exit face = visible back wall or floor
-    vec3 a = abs(hit) / B;
-    vec3 n;
-    if (a.x > a.y && a.x > a.z)      n = vec3(-sign(hit.x), 0.0, 0.0);
-    else if (a.y > a.z)              n = vec3(0.0, -sign(hit.y), 0.0);
-    else                             n = vec3(0.0, 0.0, -sign(hit.z));
-    bool isFloor = n.y > 0.5;
-    vec3 base = isFloor ? vec3(0.10, 0.11, 0.125) : vec3(0.065, 0.075, 0.09);
-    float diff = max(dot(n, uLightW), 0.0);
-    col = base * (0.5 + 0.5 * diff);
-
-    // Subtle grid lines every 8 sim cells.
-    vec2 tuv = (abs(n.x) > 0.5) ? hit.yz : (abs(n.y) > 0.5 ? hit.xz : hit.xy);
-    vec2 g2 = abs(fract(tuv * (GRIDF / 16.0)) - 0.5) / (GRIDF / 16.0);
-    float line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
-    col *= mix(1.3, 1.0, line);
-
-    // Faint glow along cube edges.
-    vec3 s = B - abs(hit);
-    float m1 = min(s.x, min(s.y, s.z));
-    float mx = max(s.x, max(s.y, s.z));
-    float mid = s.x + s.y + s.z - m1 - mx;
-    col += vec3(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+    col = shadeWall(hit, uLightW);
   }
 
   vec4 clip = uPV * vec4(hit, 1.0);
@@ -701,7 +716,7 @@ void main() {
 
   // --- Volumetric raymarcher (r=volume) ---------------------------------
 
-  // One-cell box blur of the grid's (velocity, mass) field into a dedicated
+  // One-cell tent blur of the grid's (velocity, mass) field into a dedicated
   // tiled (mass, |momentum|) texture: the raw per-substep mass is too
   // speckly (4 particles/cell at rest) for a stable iso-surface.
   const fsVolBlur = header + `
@@ -735,7 +750,7 @@ void main() {
   // Beer-Lambert absorption from the marched interior density, and the
   // analytic scene (walls + rocks) continued along the refracted ray.
   // Rendered into a scaled offscreen target and upscaled after.
-  const fsVolume = header + `
+  const fsVolume = header + sceneShade + `
 uniform sampler2D uDens; // blurred (mass, |momentum|), tiled like the grid
 uniform vec3 uCamPos, uCamR, uCamU, uCamF;
 uniform vec2 uRes;       // scaled target size
@@ -743,7 +758,6 @@ uniform float uTanF, uAspect;
 uniform vec3 uLightW;
 out vec4 o;
 
-const float B = ${(1 - 4 / GRID).toFixed(6)};
 const float ISO = 0.5;                        // iso threshold, particles/cell
 const float STEP = ${(1 / GRID).toFixed(6)};  // 0.5 grid cells, world units
 const int MAXIT = ${Math.ceil(3.5 * GRID)};   // covers the cube diagonal
@@ -807,38 +821,8 @@ vec4 traceScene(vec3 ro, vec3 rd) {
   }
 
   vec3 hit = ro + rd * tHit;
-  vec3 col;
-  if (isRock) {
-    vec3 cell = floor((hit - rockC) * 60.0 + rockId * 23.0);
-    float n1 = hash1(cell);
-    float n2 = hash1(cell + 17.0);
-    float n3 = hash1(cell + 43.0);
-    nrm = normalize(nrm + (vec3(n1, n2, n3) - 0.5) * 0.35);
-    float diff = max(dot(nrm, uLightW), 0.0);
-    float ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
-    vec3 base = mix(vec3(0.30, 0.27, 0.24), vec3(0.42, 0.40, 0.37), n1);
-    col = base * (0.30 + 0.75 * diff) * ao;
-  } else {
-    vec3 a = abs(hit) / B;
-    vec3 n;
-    if (a.x > a.y && a.x > a.z)      n = vec3(-sign(hit.x), 0.0, 0.0);
-    else if (a.y > a.z)              n = vec3(0.0, -sign(hit.y), 0.0);
-    else                             n = vec3(0.0, 0.0, -sign(hit.z));
-    vec3 base = n.y > 0.5 ? vec3(0.10, 0.11, 0.125) : vec3(0.065, 0.075, 0.09);
-    float diff = max(dot(n, uLightW), 0.0);
-    col = base * (0.5 + 0.5 * diff);
-
-    vec2 tuv = (abs(n.x) > 0.5) ? hit.yz : (abs(n.y) > 0.5 ? hit.xz : hit.xy);
-    vec2 g2 = abs(fract(tuv * (GRIDF / 16.0)) - 0.5) / (GRIDF / 16.0);
-    float line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
-    col *= mix(1.3, 1.0, line);
-
-    vec3 sd = vec3(B) - abs(hit);
-    float m1 = min(sd.x, min(sd.y, sd.z));
-    float mx = max(sd.x, max(sd.y, sd.z));
-    float mid = sd.x + sd.y + sd.z - m1 - mx;
-    col += vec3(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
-  }
+  vec3 col = isRock ? shadeRock(hit, nrm, rockC, rockId, uLightW)
+                    : shadeWall(hit, uLightW);
   return vec4(col, tHit);
 }
 
@@ -921,7 +905,7 @@ void main() {
 `;
 
   // Upscale blit of the scaled volume target to the canvas.
-  const fsUpscale = header + `
+  const fsVolUpscale = header + `
 uniform sampler2D uScene; // linear-filtered scaled target
 uniform vec2 uRes;        // canvas size
 out vec4 o;
@@ -967,7 +951,7 @@ void main() {
     vsQuad, vsP2G1, vsP2G2, fsScatter, fsDensity, fsGrid, fsG2P,
     vsPoint, fsPoint, fsBackground,
     fsPointDepth, vsThick, fsThick, fsBlur, fsComposite, fsBlit,
-    fsVolBlur, fsVolume, fsUpscale,
+    fsVolBlur, fsVolume, fsVolUpscale,
     vsGizmo, fsGizmo,
   };
 }

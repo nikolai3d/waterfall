@@ -16,6 +16,11 @@ let PTEX = parseInt(params.get('p') || '384', 10);
 if (!(PTEX >= 4 && PTEX <= 2048)) PTEX = 384;
 const LIFE = parseInt(params.get('l') || '2600', 10);
 
+// Volume renderer offscreen scale (?rscale=, default 0.5 — the raymarch is
+// heavy at full resolution; the low-res target is load-bearing).
+let RSCALE = parseFloat(params.get('rscale') || '0.5');
+if (!(RSCALE >= 0.1 && RSCALE <= 1)) RSCALE = 0.5;
+
 // The CFL clamp caps velocity in cells/substep, so finer grids need more
 // substeps per frame to move at the same world-space speed.
 const defaultSubsteps = () => Math.max(1, Math.round(GRID / 32));
@@ -119,7 +124,7 @@ function initialParticleData() {
 function config() {
   N = PTEX * PTEX;
   updateRockData();
-  return { GRID, PTEX, LIFE, N, initialData: initialParticleData(), rockData, rockVel };
+  return { GRID, PTEX, LIFE, N, RSCALE, initialData: initialParticleData(), rockData, rockVel };
 }
 
 backend.init(config());
@@ -335,7 +340,9 @@ canvas.addEventListener('wheel', (e) => {
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
   if (e.code === 'KeyF') {
-    renderMode = renderMode === 'ssf' ? 'points' : 'ssf';
+    // Cycle through all renderer chips in panel order.
+    const modes = [...panel.querySelectorAll('button[data-r]')].map((b) => b.dataset.r);
+    renderMode = modes[(modes.indexOf(renderMode) + 1) % modes.length];
     syncURL();
     syncPanel();
   }
@@ -490,7 +497,8 @@ function tick(now) {
   if (!benchDone && now - lastFps > 500) {
     const fps = (frames * 1000) / (now - lastFps);
     statsEl.textContent =
-      `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${renderMode} · ${backend.name}` +
+      `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${renderMode}` +
+      (renderMode === 'volume' ? ` rscale=${RSCALE}` : '') + ` · ${backend.name}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;
