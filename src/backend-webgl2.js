@@ -54,7 +54,7 @@ export async function createBackend({ canvas, fail }) {
     const fmt = {
       [gl.RGBA32F]: [gl.RGBA, gl.FLOAT],
       [gl.R32F]: [gl.RED, gl.FLOAT],
-      [gl.RG16F]: [gl.RG, gl.HALF_FLOAT],
+      [gl.RGBA16F]: [gl.RGBA, gl.HALF_FLOAT],
       [gl.RGBA8]: [gl.RGBA, gl.UNSIGNED_BYTE],
     }[internal];
     const t = gl.createTexture();
@@ -194,7 +194,7 @@ export async function createBackend({ canvas, fail }) {
     const waterDepth = createTex(w, h, null, gl.R32F);
     const blurA = createTex(w, h, null, gl.R32F);
     const blurB = createTex(w, h, null, gl.R32F);
-    const thick = createTex(hw, hh, null, gl.RG16F, gl.LINEAR);
+    const thick = createTex(hw, hh, null, gl.RGBA16F, gl.LINEAR);
     RT = {
       w, h, hw, hh,
       sceneColor, waterDepth, blurA, blurB, thick,

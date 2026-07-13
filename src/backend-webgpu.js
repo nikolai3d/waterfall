@@ -200,7 +200,7 @@ export async function createBackend({ canvas, fail }) {
       thick: device.createRenderPipeline({
         layout: thickPipeLayout,
         vertex: { module: renderModule, entryPoint: 'vsThick' },
-        fragment: { module: renderModule, entryPoint: 'fsThick', targets: [{ format: 'rg16float', blend: addBlend }] },
+        fragment: { module: renderModule, entryPoint: 'fsThick', targets: [{ format: 'rgba16float', blend: addBlend }] },
         primitive: { topology: 'triangle-strip' },
       }),
       gizmoDepth: rp({
@@ -308,7 +308,7 @@ export async function createBackend({ canvas, fail }) {
     const waterDepth = tex('r32float', w, h);
     const blurA = tex('r32float', w, h);
     const blurB = tex('r32float', w, h);
-    const thick = tex('rg16float', hw, hh);
+    const thick = tex('rgba16float', hw, hh);
 
     const v = {
       sceneColor: sceneColor.createView(),
