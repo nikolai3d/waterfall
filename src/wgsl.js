@@ -340,30 +340,23 @@ fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
 }
 `;
 
-  // Shared hit-point shading for the analytic scene, appended into BOTH the
-  // render module (fsBackground) and the volume module (whose traceScene
-  // reuses the same look), so a wall/rock look tweak is one edit per
-  // language (see shaders.js for GLSL). Intersection logic stays with each
-  // shader.
-  const sceneShade = `
-// Rock: noise in rock-local coordinates (offset per rock), so the texture
-// is attached to the rock and moves with it when dragged, instead of the
-// rock sliding through a fixed world-space noise volume.
-fn shadeRock(hit: vec3f, nrm0: vec3f, rockC: vec3f, rockId: f32, lightW: vec3f) -> vec3f {
-  let cell = floor((hit - rockC) * 60.0 + vec3f(rockId * 23.0));
-  let n1 = hash1(cell);
-  let n2 = hash1(cell + vec3f(17.0));
-  let n3 = hash1(cell + vec3f(43.0));
-  let nrm = normalize(nrm0 + (vec3f(n1, n2, n3) - vec3f(0.5)) * 0.35);
-  let diff = max(dot(nrm, lightW), 0.0);
-  let ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
-  let base = mix(vec3f(0.30, 0.27, 0.24), vec3f(0.42, 0.40, 0.37), n1);
-  return base * (0.30 + 0.75 * diff) * ao;
-}
+  // Shared SURFACE PROPERTIES of the analytic scene — albedo, emission, and
+  // the shading normal, with lighting left to the consumer. Consumed by BOTH
+  // the forward shaders (shadeWall/shadeRock in sceneShade below, used by
+  // fsBackground/volume/mesh) and the path tracer's intersectScene, so a
+  // wall/rock look tweak stays one edit per language (see shaders.js for
+  // GLSL). Intersection logic stays with each shader.
+  const sceneSurface = `
+struct WallS {
+  n: vec3f,     // face normal
+  alb: vec3f,   // base color with the grid lines folded in
+  emit: vec3f,  // edge glow
+};
 
 // Wall/floor: base color with subtle grid lines every 8 sim cells and a
-// faint glow along the cube edges.
-fn shadeWall(hit: vec3f, lightW: vec3f) -> vec3f {
+// faint glow along the cube edges (returned as emission).
+fn wallSurface(hit: vec3f) -> WallS {
+  var s: WallS;
   let a = abs(hit) / B;
   var n: vec3f;
   if (a.x > a.y && a.x > a.z) { n = vec3f(-sign(hit.x), 0.0, 0.0); }
@@ -371,8 +364,6 @@ fn shadeWall(hit: vec3f, lightW: vec3f) -> vec3f {
   else { n = vec3f(0.0, 0.0, -sign(hit.z)); }
   var base = vec3f(0.065, 0.075, 0.09);
   if (n.y > 0.5) { base = vec3f(0.10, 0.11, 0.125); }
-  let diff = max(dot(n, lightW), 0.0);
-  var col = base * (0.5 + 0.5 * diff);
 
   var tuv: vec2f;
   if (abs(n.x) > 0.5) { tuv = hit.yz; }
@@ -380,14 +371,51 @@ fn shadeWall(hit: vec3f, lightW: vec3f) -> vec3f {
   else { tuv = hit.xy; }
   let g2 = abs(fract(tuv * (GRIDF / 16.0)) - vec2f(0.5)) / (GRIDF / 16.0);
   let line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
-  col *= mix(1.3, 1.0, line);
+  s.n = n;
+  s.alb = base * mix(1.3, 1.0, line);
 
   let sd = vec3f(B) - abs(hit);
   let m1 = min(sd.x, min(sd.y, sd.z));
   let mx = max(sd.x, max(sd.y, sd.z));
   let mid = sd.x + sd.y + sd.z - m1 - mx;
-  col += vec3f(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
-  return col;
+  s.emit = vec3f(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+  return s;
+}
+
+struct RockS {
+  n: vec3f,    // noise-perturbed shading normal
+  alb: vec3f,  // noise-mixed base with the floor AO folded in
+};
+
+// Rock: noise in rock-local coordinates (offset per rock), so the texture
+// is attached to the rock and moves with it when dragged, instead of the
+// rock sliding through a fixed world-space noise volume. nrm0 is the
+// geometric sphere normal.
+fn rockSurface(hit: vec3f, nrm0: vec3f, rockC: vec3f, rockId: f32) -> RockS {
+  var s: RockS;
+  let cell = floor((hit - rockC) * 60.0 + vec3f(rockId * 23.0));
+  let n1 = hash1(cell);
+  let n2 = hash1(cell + vec3f(17.0));
+  let n3 = hash1(cell + vec3f(43.0));
+  s.n = normalize(nrm0 + (vec3f(n1, n2, n3) - vec3f(0.5)) * 0.35);
+  let ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
+  s.alb = mix(vec3f(0.30, 0.27, 0.24), vec3f(0.42, 0.40, 0.37), n1) * ao;
+  return s;
+}
+`;
+
+  // Forward (single-bounce) shading of those surface properties.
+  const sceneShade = sceneSurface + `
+fn shadeRock(hit: vec3f, nrm0: vec3f, rockC: vec3f, rockId: f32, lightW: vec3f) -> vec3f {
+  let s = rockSurface(hit, nrm0, rockC, rockId);
+  let diff = max(dot(s.n, lightW), 0.0);
+  return s.alb * (0.30 + 0.75 * diff);
+}
+
+fn shadeWall(hit: vec3f, lightW: vec3f) -> vec3f {
+  let s = wallSurface(hit);
+  let diff = max(dot(s.n, lightW), 0.0);
+  return s.alb * (0.5 + 0.5 * diff) + s.emit;
 }
 `;
 
@@ -1501,12 +1529,14 @@ fn fsMesh(v: MeshVSOut) -> @location(0) vec4f {
   // through the walls (only rocks and water block shadow rays — water
   // attenuates Beer-Lambert, giving colored water shadows and caustic-ish
   // pools of light on the floor), plus a small constant ambient at every
-  // surface event. Wall/rock albedos are shadeRock/shadeWall with the
-  // lighting factored out (duplicated here rather than refactoring the
-  // shared shading, so the other renderers stay pixel-identical); the wall
-  // edge glow becomes emission. Water events split reflect/refract by
-  // Schlick-Fresnel russian roulette; interior scattering is absorption-only
-  // (issue #10 v1). Diffuse bounces are cosine-weighted; russian-roulette
+  // surface event. Wall/rock albedos, emission (the wall edge glow), and
+  // shading normals come from the shared wallSurface/rockSurface (the same
+  // functions shadeWall/shadeRock build the forward look from). Water events
+  // split reflect/refract by Schlick-Fresnel russian roulette; interior
+  // scattering is absorption-only (issue #10 v1). Diffuse bounces are
+  // cosine-weighted about the GEOMETRIC normal (the noise-perturbed rock
+  // normal only drives the direct-light cosine, so sampled directions can't
+  // dip below the horizon and tunnel into the rock); russian-roulette
   // termination kicks in after bounce 2.
   const trace = common + renderUStruct + `
 struct TraceU {
@@ -1535,7 +1565,7 @@ fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
   return vec4f(p * 2.0 - vec2f(1.0), 0.0, 1.0);
 }
-` + densSample + `
+` + densSample + sceneSurface + `
 fn gradD(p: vec3f) -> vec3f {
   let h = 2.0 / GRIDF; // one cell
   return vec3f(
@@ -1571,13 +1601,15 @@ fn cosineDir(n: vec3f) -> vec3f {
 
 struct SceneH {
   t: f32,
-  n: vec3f,
+  n: vec3f,   // shading normal (noise-perturbed on rocks)
+  ng: vec3f,  // geometric normal: hemisphere sampling + ray-origin offsets
   alb: vec3f,
   emit: vec3f,
 };
 
 // Nearest wall/rock hit for a ray inside the cube: geometry as traceScene,
-// but returning normal + albedo + emission instead of a shaded color.
+// surface properties from the shared wallSurface/rockSurface (normal +
+// albedo + emission instead of a shaded color).
 fn intersectScene(ro: vec3f, rd: vec3f) -> SceneH {
   var h: SceneH;
   let inv = 1.0 / rd;
@@ -1586,30 +1618,12 @@ fn intersectScene(ro: vec3f, rd: vec3f) -> SceneH {
   let tmax3 = max(ta, tb);
   h.t = max(min(min(tmax3.x, tmax3.y), tmax3.z), EPS);
 
-  // Wall: shadeWall's base + grid lines as albedo, edge glow as emission.
-  let hp = ro + rd * h.t;
-  let a = abs(hp) / B;
-  var n: vec3f;
-  if (a.x > a.y && a.x > a.z) { n = vec3f(-sign(hp.x), 0.0, 0.0); }
-  else if (a.y > a.z) { n = vec3f(0.0, -sign(hp.y), 0.0); }
-  else { n = vec3f(0.0, 0.0, -sign(hp.z)); }
-  var base = vec3f(0.065, 0.075, 0.09);
-  if (n.y > 0.5) { base = vec3f(0.10, 0.11, 0.125); }
-  var tuv: vec2f;
-  if (abs(n.x) > 0.5) { tuv = hp.yz; }
-  else if (abs(n.y) > 0.5) { tuv = hp.xz; }
-  else { tuv = hp.xy; }
-  let g2 = abs(fract(tuv * (GRIDF / 16.0)) - vec2f(0.5)) / (GRIDF / 16.0);
-  let line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
-  h.n = n;
-  h.alb = base * mix(1.3, 1.0, line);
-  let sd = vec3f(B) - abs(hp);
-  let m1 = min(sd.x, min(sd.y, sd.z));
-  let mx = max(sd.x, max(sd.y, sd.z));
-  let mid = sd.x + sd.y + sd.z - m1 - mx;
-  h.emit = vec3f(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+  let ws = wallSurface(ro + rd * h.t);
+  h.n = ws.n;
+  h.ng = ws.n;
+  h.alb = ws.alb;
+  h.emit = ws.emit;
 
-  // Rocks: shadeRock's noise albedo + perturbed normal.
   for (var i = 0; i < NROCK; i++) {
     let c = R.rocks[i].xyz * (2.0 / GRIDF) - vec3f(1.0);
     let r = R.rocks[i].w * (2.0 / GRIDF);
@@ -1620,14 +1634,12 @@ fn intersectScene(ro: vec3f, rd: vec3f) -> SceneH {
       let t = -b - sqrt(hq);
       if (t > EPS && t < h.t) {
         let hit = ro + rd * t;
-        let cell = floor((hit - c) * 60.0 + vec3f(f32(i) * 23.0));
-        let n1 = hash1(cell);
-        let n2 = hash1(cell + vec3f(17.0));
-        let n3 = hash1(cell + vec3f(43.0));
-        let ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
+        let ng = normalize(hit - c);
+        let rs = rockSurface(hit, ng, c, f32(i));
         h.t = t;
-        h.n = normalize(normalize(hit - c) + (vec3f(n1, n2, n3) - vec3f(0.5)) * 0.35);
-        h.alb = mix(vec3f(0.30, 0.27, 0.24), vec3f(0.42, 0.40, 0.37), n1) * ao;
+        h.n = rs.n;
+        h.ng = ng;
+        h.alb = rs.alb;
         h.emit = vec3f(0.0);
       }
     }
@@ -1704,7 +1716,6 @@ fn samplePath(fragXY: vec2f) -> vec4f {
         let tn = min(t + STEP2, sh.t);
         let mid = 0.5 * (t + tn);
         let d = density(ro + rd * mid);
-        tau += d / REST * (tn - t);
         if (d < TISO) {
           var lo = t;
           var hi = mid;
@@ -1713,8 +1724,12 @@ fn samplePath(fragXY: vec2f) -> vec4f {
             if (density(ro + rd * m2) < TISO) { hi = m2; } else { lo = m2; }
           }
           tExit = 0.5 * (lo + hi);
+          // The final slice ends at the bisected exit, not the full step:
+          // counting water the ray never crossed over-darkens thin exits.
+          tau += d / REST * (tExit - t);
           break;
         }
+        tau += d / REST * (tn - t);
         t = tn;
         if (t >= sh.t) { break; }
       }
@@ -1776,15 +1791,19 @@ fn samplePath(fragXY: vec2f) -> vec4f {
     if (surface) {
       // Diffuse surface event: emission, shadowed direct light, ambient,
       // then a cosine-weighted bounce (cos/pi folds into the sampling).
+      // The hemisphere and the ray-origin offsets use the GEOMETRIC normal
+      // so the noise-perturbed rock normal can't produce directions below
+      // the horizon that tunnel into the rock; the shading normal only
+      // drives the direct-light cosine.
       let P = ro + rd * sh.t;
       radiance += throughput * sh.emit;
       let ndl = max(dot(sh.n, R.lightW.xyz), 0.0);
       var direct = vec3f(0.0);
-      if (ndl > 0.0) { direct = LIGHTCOL * ndl * lightTransmit(P + sh.n * EPS); }
+      if (ndl > 0.0) { direct = LIGHTCOL * ndl * lightTransmit(P + sh.ng * EPS); }
       radiance += throughput * sh.alb * (direct + AMBIENT);
       throughput *= sh.alb;
-      rd = cosineDir(sh.n);
-      ro = P + sh.n * EPS;
+      rd = cosineDir(sh.ng);
+      ro = P + sh.ng * EPS;
     }
 
     // Russian-roulette termination after bounce 2.

@@ -206,6 +206,7 @@ export async function createBackend({ canvas, fail }) {
   let mcBG = null;
   let meshBG = null;
   let substepCount = 0;
+  let volBlurredAt = -1; // substepCount at the last density blur (-1 = stale)
   let simBuffers = [];
 
   // Sim uniform staging: rocks (16f) + rockVel (16f, vec3 padded) + frame.
@@ -414,6 +415,21 @@ export async function createBackend({ canvas, fail }) {
 
     makeRenderBG();
     substepCount = 0;
+    volBlurredAt = -1; // fresh bufVolDens: force a re-blur on the next frame
+  }
+
+  // Tent-blur the grid density into bufVolDens — but only when the grid
+  // actually changed (a substep ran, or init rebuilt the buffers). Paused
+  // frames — the trace renderer's "cook" frames especially — would otherwise
+  // re-blur an unchanged grid every frame.
+  function encodeVolBlur(enc) {
+    if (volBlurredAt === substepCount) return;
+    const cpass = enc.beginComputePass();
+    cpass.setPipeline(pipes.volBlur);
+    cpass.setBindGroup(0, volBlurBG);
+    cpass.dispatchWorkgroups(Math.ceil(NCELL / 64));
+    cpass.end();
+    volBlurredAt = substepCount;
   }
 
   // Trace accumulation ping-pong at the scaled (RSCALE) size. The textures
@@ -640,12 +656,9 @@ export async function createBackend({ canvas, fail }) {
 
     if (frame.mode === 'volume' || frame.mode === 'voxel') {
       // Volumetric raymarch / voxel DDA: tent-blur the grid density
-      // (compute), trace it into a scaled offscreen target, upscale.
-      const cpass = enc.beginComputePass();
-      cpass.setPipeline(pipes.volBlur);
-      cpass.setBindGroup(0, volBlurBG);
-      cpass.dispatchWorkgroups(Math.ceil(NCELL / 64));
-      cpass.end();
+      // (compute, skipped when the grid is unchanged), trace it into a
+      // scaled offscreen target, upscale.
+      encodeVolBlur(enc);
 
       let pass = enc.beginRenderPass({
         colorAttachments: [{ view: RT.v.volColor, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
@@ -681,11 +694,7 @@ export async function createBackend({ canvas, fail }) {
       traceUData[0] = Math.max(frame.accFrame || 0, 1);
       device.queue.writeBuffer(bufTraceU, 0, traceUData);
 
-      const cpass = enc.beginComputePass();
-      cpass.setPipeline(pipes.volBlur);
-      cpass.setBindGroup(0, volBlurBG);
-      cpass.dispatchWorkgroups(Math.ceil(NCELL / 64));
-      cpass.end();
+      encodeVolBlur(enc);
 
       let pass = enc.beginRenderPass({
         colorAttachments: [{ view: traceRT.views[traceFlip], loadOp: 'clear', storeOp: 'store' }],
@@ -727,10 +736,8 @@ export async function createBackend({ canvas, fail }) {
       // pass as the raytraced background — real occlusion both ways.
       ensureMeshResources();
       device.queue.writeBuffer(bufMCArgs, 0, mcArgsReset);
+      encodeVolBlur(enc);
       const cpass = enc.beginComputePass();
-      cpass.setPipeline(pipes.volBlur);
-      cpass.setBindGroup(0, volBlurBG);
-      cpass.dispatchWorkgroups(Math.ceil(NCELL / 64));
       cpass.setPipeline(pipes.mcEmit);
       cpass.setBindGroup(0, mcBG);
       cpass.dispatchWorkgroups(Math.ceil(NCELL / 64));
