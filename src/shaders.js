@@ -2,17 +2,33 @@
 // All shaders share a generated header with simulation constants and helpers.
 
 export const ROCKS = [
-  // x, y, z (grid units), radius
+  // x, y, z (grid units at the reference 64 grid), radius
   [16.0, 6.0, 32.0, 8.0],
   [27.0, 4.5, 23.0, 5.5],
   [25.0, 4.0, 42.0, 5.0],
   [39.0, 3.5, 33.0, 4.0],
 ];
 
-export function makeShaders(opts) {
-  const { PTEX, LIFE } = opts;
+// The scene is fixed in world units; geometry defined at the reference 64
+// grid scales with the actual grid resolution.
+export function scaleRocks(GRID) {
+  return ROCKS.map((r) => r.map((v) => (v * GRID) / 64));
+}
 
-  const rockInit = ROCKS.map(
+// z-slice tiling of the 3D grid into a 2D texture. TILES² ≥ GRID; unused
+// tiles are never addressed (gridTexel only sees z < GRID).
+export function gridLayout(GRID) {
+  const TILES = Math.ceil(Math.sqrt(GRID));
+  return { TILES, GTEX: GRID * TILES };
+}
+
+export function makeShaders(opts) {
+  const { GRID, PTEX, LIFE } = opts;
+  const { TILES, GTEX } = gridLayout(GRID);
+  const s = GRID / 64;
+  const vec3 = (a) => `vec3(${a.map((v) => v.toFixed(2)).join(', ')})`;
+
+  const rockInit = scaleRocks(GRID).map(
     (r) => `vec4(${r.map((v) => v.toFixed(2)).join(', ')})`
   ).join(',\n  ');
 
@@ -21,10 +37,10 @@ precision highp float;
 precision highp int;
 precision highp sampler2D;
 
-const int   GRIDI = 64;          // grid resolution per axis
-const float GRIDF = 64.0;
-const int   TILES = 8;           // z-slices tiled 8x8 into a 2D texture
-const int   GTEX  = 512;         // grid texture size (GRIDI * TILES)
+const int   GRIDI = ${GRID};     // grid resolution per axis
+const float GRIDF = ${GRID.toFixed(1)};
+const int   TILES = ${TILES};    // z-slices tiled TILESxTILES into a 2D texture
+const int   GTEX  = ${GTEX};     // grid texture size (GRIDI * TILES)
 const int   PTEX  = ${PTEX};     // particle state texture size
 
 const float MASS  = 1.0;         // particle mass
@@ -36,8 +52,8 @@ const float GRAV  = -0.010;      // gravity per substep (dt = 1)
 const float VMAX  = 0.85;        // CFL velocity clamp (cells per substep)
 const float LIFE  = ${LIFE.toFixed(1)}; // particle lifetime in substeps
 
-const vec3 EMIT_P = vec3(7.0, 59.0, 32.0);   // spout position
-const vec3 EMIT_R = vec3(2.0, 1.5, 13.0);    // spout extent (a wide sheet)
+const vec3 EMIT_P = ${vec3([7 * s, 59 * s, 32 * s])};   // spout position
+const vec3 EMIT_R = ${vec3([2 * s, 1.5 * s, 13 * s])};  // spout extent (a wide sheet)
 const vec3 EMIT_V = vec3(0.10, -0.05, 0.0);  // initial jet velocity
 
 const float PRADIUS = 0.021;     // particle render radius, world units
@@ -550,7 +566,7 @@ uniform mat4 uPV;
 uniform vec3 uLightW;
 out vec4 o;
 
-const float B = 0.9375; // wall extent in world units (grid cells 2..62)
+const float B = ${(1 - 4 / GRID).toFixed(6)}; // wall extent in world units (grid cells 2..GRIDI-2)
 
 void main() {
   vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
@@ -576,8 +592,8 @@ void main() {
   vec3 nrm = vec3(0.0);
   bool isRock = false;
   for (int i = 0; i < NROCK; i++) {
-    vec3 c = ROCKS[i].xyz / 32.0 - 1.0;
-    float r = ROCKS[i].w / 32.0;
+    vec3 c = ROCKS[i].xyz * (2.0 / GRIDF) - 1.0;
+    float r = ROCKS[i].w * (2.0 / GRIDF);
     vec3 oc = uCamPos - c;
     float b = dot(oc, rd);
     float h = b * b - (dot(oc, oc) - r * r);
@@ -617,7 +633,7 @@ void main() {
 
     // Subtle grid lines every 8 sim cells.
     vec2 tuv = (abs(n.x) > 0.5) ? hit.yz : (abs(n.y) > 0.5 ? hit.xz : hit.xy);
-    vec2 g2 = abs(fract(tuv * 4.0) - 0.5) / 4.0;
+    vec2 g2 = abs(fract(tuv * (GRIDF / 16.0)) - 0.5) / (GRIDF / 16.0);
     float line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
     col *= mix(1.3, 1.0, line);
 

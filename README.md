@@ -20,7 +20,10 @@ python3 -m http.server 8123
 ```
 
 Controls: **drag** to orbit, **wheel** to zoom, **space** to pause,
-**f** to toggle between the water surface and raw particle view.
+**f** to toggle between the water surface and raw particle view. The panel
+in the top-right corner adjusts grid resolution (32³–128³) and particle
+count (128²–384²); changing either restarts the water in place (the camera
+survives).
 
 ## How it works
 
@@ -42,8 +45,9 @@ float textures and runs in shaders. Per substep:
    grid and advect. Particles are recycled through the spout on a fixed
    lifetime, so the waterfall runs forever.
 
-The 64³ grid is tiled into a 512×512 2D texture (WebGL2 can't render into 3D
-textures per-slice with blending). Rocks and walls are raytraced analytically
+The 3D grid is tiled slice-by-slice into a 2D texture (WebGL2 can't render
+into 3D textures per-slice with blending) — e.g. 64³ into 512×512, with the
+tiling derived per grid size. Rocks and walls are raytraced analytically
 in a fragment shader that writes real depth, so the water composites
 correctly against them.
 
@@ -63,14 +67,15 @@ visible — visually minor.
 
 ## URL parameters
 
-| param  | default | meaning                                          |
-| ------ | ------- | ------------------------------------------------ |
-| `p`    | 256     | particle texture size (`p`² particles)           |
-| `s`    | 2       | simulation substeps per frame                    |
-| `l`    | 2600    | particle lifetime in substeps (spout recycling)  |
-| `warm` | 0       | substeps to pre-simulate before the first frame  |
-| `r`    | `ssf`   | rendering: `ssf` (water surface) or `points`     |
-| `dbg`  | off     | overlay with GPU-readback particle statistics    |
+| param  | default    | meaning                                            |
+| ------ | ---------- | -------------------------------------------------- |
+| `g`    | 64         | grid resolution per axis (32, 64, 96, or 128)      |
+| `p`    | 256        | particle texture size (`p`² particles)             |
+| `s`    | `g` / 32   | simulation substeps per frame                      |
+| `l`    | 2600       | particle lifetime in substeps (spout recycling)    |
+| `warm` | 0          | substeps to pre-simulate before the first frame    |
+| `r`    | `ssf`      | rendering: `ssf` (water surface) or `points`       |
+| `dbg`  | off        | overlay with GPU-readback particle statistics      |
 
 Example: [`?p=128&s=3`](http://localhost:8123/?p=128&s=3) for slower machines.
 

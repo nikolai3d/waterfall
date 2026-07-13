@@ -7,16 +7,26 @@
 //   4. grid   momentum -> velocity, gravity, boundary conditions
 //   5. G2P    gather velocity + affine matrix, advect, spawn/recycle
 
-import { makeShaders, ROCKS } from './shaders.js';
+import { makeShaders, scaleRocks, gridLayout } from './shaders.js';
 
 const params = new URLSearchParams(location.search);
-const PTEX = parseInt(params.get('p') || '256', 10);
-const SUBSTEPS = parseInt(params.get('s') || '2', 10);
-const LIFE = parseInt(params.get('l') || '2600', 10);
-const N = PTEX * PTEX;
+const GRID_SIZES = [32, 64, 96, 128];
 
-const GRID = 64;
-const GTEX = 512;
+let GRID = parseInt(params.get('g') || '64', 10);
+if (!GRID_SIZES.includes(GRID)) GRID = 64;
+let PTEX = parseInt(params.get('p') || '256', 10);
+if (!(PTEX >= 4 && PTEX <= 2048)) PTEX = 256;
+const LIFE = parseInt(params.get('l') || '2600', 10);
+
+// The CFL clamp caps velocity in cells/substep, so finer grids need more
+// substeps per frame to move at the same world-space speed.
+const defaultSubsteps = () => Math.max(1, Math.round(GRID / 32));
+const S_EXPLICIT = params.has('s');
+let SUBSTEPS = S_EXPLICIT ? parseInt(params.get('s'), 10) : defaultSubsteps();
+
+let N = PTEX * PTEX;
+let GTEX = gridLayout(GRID).GTEX;
+let rocks = scaleRocks(GRID);
 
 const canvas = document.getElementById('view');
 const statsEl = document.getElementById('stats');
@@ -120,32 +130,22 @@ function bindTex(unit, tex, prog, name) {
   gl.uniform1i(u(prog, name), unit);
 }
 
-// ---------------------------------------------------------------------------
-// Programs
-
-const S = makeShaders({ PTEX, LIFE });
-const progP2G1 = compile(S.vsP2G1, S.fsScatter, 'p2g1');
-const progP2G2 = compile(S.vsP2G2, S.fsScatter, 'p2g2');
-const progDensity = compile(S.vsQuad, S.fsDensity, 'density');
-const progGrid = compile(S.vsQuad, S.fsGrid, 'grid');
-const progG2P = compile(S.vsQuad, S.fsG2P, 'g2p');
-const progBG = compile(S.vsQuad, S.fsBackground, 'background');
-const progPoints = compile(S.vsPoint, S.fsPoint, 'points');
-const progPointDepth = compile(S.vsPoint, S.fsPointDepth, 'pointDepth');
-const progThick = compile(S.vsThick, S.fsThick, 'thickness');
-const progBlur = compile(S.vsQuad, S.fsBlur, 'blur');
-const progComposite = compile(S.vsQuad, S.fsComposite, 'composite');
-const progBlit = compile(S.vsQuad, S.fsBlit, 'blit');
-
 const vao = gl.createVertexArray();
 gl.bindVertexArray(vao);
 
 // ---------------------------------------------------------------------------
-// State textures
+// Simulation state (programs + textures bake GRID/PTEX/LIFE in, so all of it
+// is torn down and rebuilt by initSim when the panel changes a parameter).
+
+let progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG, progPoints,
+  progPointDepth, progThick, progBlur, progComposite, progBlit;
+let programs = [];
+let cur, nxt, gridA, gridB, gridAFBO, gridBFBO, densTex, densFBO;
+let substepCount = 0;
 
 function sdRocksJS(x, y, z) {
   let d = 1e9;
-  for (const [cx, cy, cz, r] of ROCKS) {
+  for (const [cx, cy, cz, r] of rocks) {
     d = Math.min(d, Math.hypot(x - cx, y - cy, z - cz) - r);
   }
   return d;
@@ -189,17 +189,56 @@ function makeParticleSet(posData) {
   return { pos, vel, c0, c1, c2, fbo };
 }
 
-const initData = initialParticleData();
-let cur = makeParticleSet(initData);
-let nxt = makeParticleSet(initData);
+function deleteParticleSet(set) {
+  gl.deleteFramebuffer(set.fbo);
+  for (const t of [set.pos, set.vel, set.c0, set.c1, set.c2]) gl.deleteTexture(t);
+}
 
-const gridA = createTex(GTEX, GTEX); // scatter target (momentum, mass)
-const gridB = createTex(GTEX, GTEX); // updated velocities
-const gridAFBO = createFBO([gridA]);
-const gridBFBO = createFBO([gridB]);
+function initSim() {
+  if (programs.length) {
+    for (const p of programs) gl.deleteProgram(p);
+    uniformCache.clear();
+    deleteParticleSet(cur);
+    deleteParticleSet(nxt);
+    for (const t of [gridA, gridB, densTex]) gl.deleteTexture(t);
+    for (const f of [gridAFBO, gridBFBO, densFBO]) gl.deleteFramebuffer(f);
+  }
 
-const densTex = createTex(PTEX, PTEX);
-const densFBO = createFBO([densTex]);
+  N = PTEX * PTEX;
+  GTEX = gridLayout(GRID).GTEX;
+  rocks = scaleRocks(GRID);
+
+  const S = makeShaders({ GRID, PTEX, LIFE });
+  progP2G1 = compile(S.vsP2G1, S.fsScatter, 'p2g1');
+  progP2G2 = compile(S.vsP2G2, S.fsScatter, 'p2g2');
+  progDensity = compile(S.vsQuad, S.fsDensity, 'density');
+  progGrid = compile(S.vsQuad, S.fsGrid, 'grid');
+  progG2P = compile(S.vsQuad, S.fsG2P, 'g2p');
+  progBG = compile(S.vsQuad, S.fsBackground, 'background');
+  progPoints = compile(S.vsPoint, S.fsPoint, 'points');
+  progPointDepth = compile(S.vsPoint, S.fsPointDepth, 'pointDepth');
+  progThick = compile(S.vsThick, S.fsThick, 'thickness');
+  progBlur = compile(S.vsQuad, S.fsBlur, 'blur');
+  progComposite = compile(S.vsQuad, S.fsComposite, 'composite');
+  progBlit = compile(S.vsQuad, S.fsBlit, 'blit');
+  programs = [progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG,
+    progPoints, progPointDepth, progThick, progBlur, progComposite, progBlit];
+
+  const initData = initialParticleData();
+  cur = makeParticleSet(initData);
+  nxt = makeParticleSet(initData);
+
+  gridA = createTex(GTEX, GTEX); // scatter target (momentum, mass)
+  gridB = createTex(GTEX, GTEX); // updated velocities
+  gridAFBO = createFBO([gridA]);
+  gridBFBO = createFBO([gridB]);
+
+  densTex = createTex(PTEX, PTEX);
+  densFBO = createFBO([densTex]);
+
+  substepCount = 0;
+}
+initSim();
 
 // Screen-space fluid rendering targets (recreated on resize).
 let RT = null;
@@ -233,8 +272,6 @@ function createTargets(w, h) {
 
 // ---------------------------------------------------------------------------
 // Simulation step
-
-let substepCount = 0;
 
 function substep() {
   gl.disable(gl.DEPTH_TEST);
@@ -375,6 +412,43 @@ window.addEventListener('keydown', (e) => {
 });
 
 let renderMode = params.get('r') === 'points' ? 'points' : 'ssf';
+
+// Resolution panel: changing a value rebuilds the whole sim in place
+// (camera and pause state survive); the URL stays shareable.
+const panel = document.getElementById('panel');
+
+function syncPanel() {
+  for (const b of panel.querySelectorAll('button[data-g]')) {
+    b.classList.toggle('on', parseInt(b.dataset.g, 10) === GRID);
+  }
+  for (const b of panel.querySelectorAll('button[data-p]')) {
+    b.classList.toggle('on', parseInt(b.dataset.p, 10) === PTEX);
+  }
+}
+syncPanel();
+
+panel.addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  if (b.dataset.g) {
+    const g = parseInt(b.dataset.g, 10);
+    if (g === GRID) return;
+    GRID = g;
+    if (!S_EXPLICIT) SUBSTEPS = defaultSubsteps();
+  } else if (b.dataset.p) {
+    const p = parseInt(b.dataset.p, 10);
+    if (p === PTEX) return;
+    PTEX = p;
+  } else {
+    return;
+  }
+  const q = new URLSearchParams(location.search);
+  q.set('g', GRID);
+  q.set('p', PTEX);
+  history.replaceState(null, '', '?' + q.toString());
+  initSim();
+  syncPanel();
+});
 
 const FOV = 0.9;
 const LIGHT = normalize3([0.5, 0.8, 0.3]);
@@ -526,7 +600,7 @@ function debugDump() {
     active++; sumY += y;
     if (y < minY) minY = y;
     if (y > maxY) maxY = y;
-    if (y > 16 && y < 55) midair++;
+    if (y > GRID * 0.25 && y < GRID * 0.86) midair++;
   }
   errEl.style.display = 'block';
   errEl.textContent = `[dbg] substep=${substepCount} active=${active} avgY=${(sumY / active).toFixed(2)} minY=${minY.toFixed(2)} maxY=${maxY.toFixed(2)} midair=${midair}`;
@@ -545,7 +619,7 @@ function tick(now) {
   if (now - lastFps > 500) {
     const fps = (frames * 1000) / (now - lastFps);
     statsEl.textContent =
-      `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · 64³ grid · ${SUBSTEPS} substeps · ${renderMode}` +
+      `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${renderMode}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;

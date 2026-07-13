@@ -16,6 +16,22 @@
     #title b { color: #d7e6f2; font-size: 14px; font-weight: 600; }
     #stats { bottom: 14px; left: 16px; }
     #help { bottom: 14px; right: 16px; text-align: right; }
+    #panel {
+      top: 14px; right: 16px; pointer-events: auto;
+      padding: 8px 10px; background: rgba(6, 11, 17, .55);
+      border: 1px solid rgba(159, 180, 196, .18); border-radius: 8px;
+    }
+    #panel .row { display: flex; align-items: center; gap: 4px; justify-content: flex-end; }
+    #panel .row + .row { margin-top: 4px; }
+    #panel .lbl { margin-right: 4px; opacity: .8; }
+    #panel .note { margin-top: 5px; text-align: right; opacity: .55; font-size: 11px; }
+    #panel button {
+      font: inherit; color: inherit; background: transparent;
+      border: 1px solid rgba(159, 180, 196, .3); border-radius: 999px;
+      padding: 1px 8px; cursor: pointer;
+    }
+    #panel button:hover { border-color: rgba(215, 230, 242, .7); }
+    #panel button.on { background: #2b4a63; color: #d7e6f2; border-color: #6d90ac; }
     #err {
       display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
       max-width: 40em; padding: 16px 20px; background: #2a1215; color: #ffb4b4;
@@ -28,6 +44,11 @@
   <canvas id="view"></canvas>
   <div id="title" class="hud"><b>waterfall</b> · MLS-MPM fluid, simulated entirely on the GPU (WebGL2)</div>
   <div id="stats" class="hud">…</div>
+  <div id="panel" class="hud">
+    <div class="row"><span class="lbl">grid</span><button data-g="32">32³</button><button data-g="64">64³</button><button data-g="96">96³</button><button data-g="128">128³</button></div>
+    <div class="row"><span class="lbl">particles</span><button data-p="128">128²</button><button data-p="192">192²</button><button data-p="256">256²</button><button data-p="384">384²</button></div>
+    <div class="note">changing a value restarts the water</div>
+  </div>
   <div id="help" class="hud">drag — orbit · wheel — zoom · space — pause · f — surface/particles</div>
   <div id="err"></div>
   <script type="module" src="src/main.js"></script>
