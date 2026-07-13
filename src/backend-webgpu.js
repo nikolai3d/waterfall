@@ -65,6 +65,17 @@ export async function createBackend({ canvas, fail }) {
       { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
     ],
   });
+  // The thickness pass additionally reads the raw water depth for occlusion;
+  // it needs its own layout because that texture is a render attachment in
+  // the pass where the main render bind group is used.
+  const thickLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+    ],
+  });
   const blurLayout = device.createBindGroupLayout({
     entries: [
       { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
@@ -82,6 +93,7 @@ export async function createBackend({ canvas, fail }) {
   });
   const simPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
   const renderPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [renderLayout] });
+  const thickPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [thickLayout] });
   const blurPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [blurLayout] });
   const compPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [compLayout] });
 
@@ -105,6 +117,7 @@ export async function createBackend({ canvas, fail }) {
   let simBG = null;
   let pipes = null;
   let renderBGGroup = null;
+  let thickBGGroup = null;
   let substepCount = 0;
   let simBuffers = [];
 
@@ -184,7 +197,8 @@ export async function createBackend({ canvas, fail }) {
         primitive: { topology: 'triangle-strip' },
         depthStencil: depthState,
       }),
-      thick: rp({
+      thick: device.createRenderPipeline({
+        layout: thickPipeLayout,
         vertex: { module: renderModule, entryPoint: 'vsThick' },
         fragment: { module: renderModule, entryPoint: 'fsThick', targets: [{ format: 'rg16float', blend: addBlend }] },
         primitive: { topology: 'triangle-strip' },
@@ -214,6 +228,15 @@ export async function createBackend({ canvas, fail }) {
       }),
     };
 
+    makeRenderBG();
+    substepCount = 0;
+  }
+
+  // The thick group depends on per-config buffers AND the per-size raw
+  // water depth (fsThick's occlusion input), so both init() and
+  // ensureTargets() rebuild it.
+  function makeRenderBG() {
+    if (!bufPos) return;
     renderBGGroup = device.createBindGroup({
       layout: renderLayout,
       entries: [
@@ -222,8 +245,16 @@ export async function createBackend({ canvas, fail }) {
         { binding: 2, resource: { buffer: bufVel } },
       ],
     });
-
-    substepCount = 0;
+    if (!RT) return;
+    thickBGGroup = device.createBindGroup({
+      layout: thickLayout,
+      entries: [
+        { binding: 0, resource: { buffer: bufRenderU } },
+        { binding: 1, resource: { buffer: bufPos } },
+        { binding: 2, resource: { buffer: bufVel } },
+        { binding: 3, resource: RT.v.waterDepth },
+      ],
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -309,6 +340,7 @@ export async function createBackend({ canvas, fail }) {
         ],
       }),
     };
+    makeRenderBG();
   }
 
   function writeRenderU(frame) {
@@ -402,7 +434,7 @@ export async function createBackend({ canvas, fail }) {
     pass = enc.beginRenderPass({
       colorAttachments: [{ view: RT.v.thick, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }],
     });
-    pass.setBindGroup(0, renderBGGroup);
+    pass.setBindGroup(0, thickBGGroup);
     pass.setPipeline(pipes.thick);
     pass.draw(4, cfg.N);
     pass.end();

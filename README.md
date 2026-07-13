@@ -72,10 +72,12 @@ that never grows outer silhouettes), and the composite fades sparse water by
 thickness, so spray reads as translucent droplets rather than opaque spheres. A composite
 pass reconstructs normals from the smoothed depth and shades the surface:
 refraction of the scene, Beer–Lambert absorption by thickness, Fresnel,
-specular, and foam. Press **f** (or `?r=points`) for the raw shaded-particle
-view. Known simplification: the thickness pass has no occlusion test, so
-water behind a rock still contributes thickness where nearer water is
-visible — visually minor.
+specular, and foam. The blur uses narrow-range lower-bound clamping
+(Truong & Yuksel, i3D 2018) so near surfaces win where they overlap far
+ones, and the thickness pass culls water well behind the visible surface
+(tested against the raw per-pixel depth), so the pool neither shows
+through the stream in front of it nor punches fake holes around it.
+Press **f** (or `?r=points`) for the raw shaded-particle view.
 
 ## URL parameters
 

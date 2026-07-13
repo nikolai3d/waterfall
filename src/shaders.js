@@ -410,27 +410,39 @@ uniform sampler2D uPos, uVel;
 uniform mat4 uProj, uView;
 uniform float uPointScale;
 flat out float vSpeed;
+flat out float vZ;
 
 void main() {
   ivec2 pt = ivec2(gl_VertexID % PTEX, gl_VertexID / PTEX);
   vec4 pa = texelFetch(uPos, pt, 0);
-  if (pa.w < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vSpeed = 0.0; return; }
+  if (pa.w < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vSpeed = 0.0; vZ = 0.0; return; }
   vec3 wp = pa.xyz * (2.0 / GRIDF) - 1.0;
   vec4 vp = uView * vec4(wp, 1.0);
   gl_Position = uProj * vp;
   gl_PointSize = clamp(uPointScale * PRADIUS * 1.7 / max(-vp.z, 0.05), 1.0, 96.0);
   vSpeed = texelFetch(uVel, pt, 0).w / VMAX;
+  vZ = -vp.z;
 }
 `;
 
   const fsThick = header + `
+uniform sampler2D uFront; // smoothed water surface depth, full resolution
 flat in float vSpeed;
+flat in float vZ;
 out vec4 o;
 
 void main() {
   vec2 q = gl_PointCoord * 2.0 - 1.0;
   float r2 = dot(q, q);
   if (r2 > 1.0) discard;
+  // Occlusion: water well behind the visible surface must not contribute
+  // thickness or foam, or the pool draws its silhouette (and dilutes foam)
+  // through the stream in front of it. Fragments outside the depth
+  // silhouette (front = 0) are kept — they feather the edges.
+  ivec2 s = textureSize(uFront, 0);
+  ivec2 px = clamp(ivec2(gl_FragCoord.xy * 2.0), ivec2(0), s - 1);
+  float front = texelFetch(uFront, px, 0).r;
+  if (front > 0.0 && vZ > front + 0.3) discard;
   float f = 1.0 - r2;
   float th = f * f * PRADIUS * 2.0;
   o = vec4(th, th * vSpeed, 0.0, 1.0);
@@ -459,9 +471,10 @@ void main() {
   float z0 = texelFetch(uDepth, tx, 0).r;
 
   // Gap fill (morphological closing): a pixel without water is filled when
-  // water lies on BOTH sides along this axis at a compatible depth, so
-  // nearby droplets merge into one surface instead of reading as separate
-  // spheres. One-sided support is rejected, so outer silhouettes never grow.
+  // water lies on BOTH sides along this axis, taking the NEARER depth when
+  // the two sides disagree, so a near surface (the stream) stays continuous
+  // in front of a far one (the pool). One-sided support is rejected, so
+  // outer silhouettes never grow.
   if (z0 <= 0.0) {
     float zp = 0.0, zm = 0.0;
     int ip = 0, im = 0;
@@ -469,22 +482,39 @@ void main() {
       if (zp <= 0.0) { zp = dfetch(tx + dir * i); ip = i; }
       if (zm <= 0.0) { zm = dfetch(tx - dir * i); im = i; }
     }
-    if (zp <= 0.0 || zm <= 0.0 || abs(zp - zm) > NRANGE) { o = vec4(0.0); return; }
+    if (zp <= 0.0 || zm <= 0.0) { o = vec4(0.0); return; }
     z0 = min(zp, zm);
     float reach = clamp(0.045 * uScalePx / z0, 2.0, 20.0);
     if (float(ip + im) > reach) { o = vec4(0.0); return; }
   }
 
+  // Narrow-range filter with lower-bound clamping (Truong & Yuksel, i3D
+  // 2018): instead of rejecting neighbors from a different surface, clamp
+  // samples toward the nearest depth in the window. Where the stream
+  // crosses in front of the pool, the near surface wins and reconstructs
+  // as one continuous sheet instead of being eaten by the far surface.
   float radius = clamp(0.045 * uScalePx / z0, 2.0, 20.0);
-  float sum = z0, wsum = 1.0;
+  float sa[20];
+  float sb[20];
+  int n = 0;
+  float zmin = z0;
   for (int i = 1; i <= 20; i++) {
-    float fi = float(i);
-    if (fi > radius) break;
-    float g = exp(-fi * fi / (0.5 * radius * radius));
+    if (float(i) > radius) break;
     float za = dfetch(tx + dir * i);
     float zb = dfetch(tx - dir * i);
-    if (za > 0.0 && abs(za - z0) < NRANGE) { sum += za * g; wsum += g; }
-    if (zb > 0.0 && abs(zb - z0) < NRANGE) { sum += zb * g; wsum += g; }
+    sa[i - 1] = za;
+    sb[i - 1] = zb;
+    n = i;
+    if (za > 0.0) zmin = min(zmin, za);
+    if (zb > 0.0) zmin = min(zmin, zb);
+  }
+  float hi = zmin + NRANGE;
+  float sum = min(z0, hi), wsum = 1.0;
+  for (int i = 1; i <= n; i++) {
+    float fi = float(i);
+    float g = exp(-fi * fi / (0.5 * radius * radius));
+    if (sa[i - 1] > 0.0) { sum += min(sa[i - 1], hi) * g; wsum += g; }
+    if (sb[i - 1] > 0.0) { sum += min(sb[i - 1], hi) * g; wsum += g; }
   }
   o = vec4(sum / wsum, 0.0, 0.0, 1.0);
 }

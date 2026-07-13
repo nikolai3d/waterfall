@@ -178,7 +178,13 @@ function mul4(a, b) {
 // ---------------------------------------------------------------------------
 // Camera + input
 
-const cam = { az: 0.7, el: 0.30, dist: 2.7, target: [0, -0.22, 0] };
+// Initial camera is URL-overridable (?az=&el=&dist=) for shareable views.
+const cam = {
+  az: parseFloat(params.get('az') ?? '0.7'),
+  el: parseFloat(params.get('el') ?? '0.30'),
+  dist: parseFloat(params.get('dist') ?? '2.7'),
+  target: [0, -0.22, 0],
+};
 let dragging = false, lastX = 0, lastY = 0, lastInteraction = -1e9;
 let paused = false;
 

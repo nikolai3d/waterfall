@@ -381,6 +381,10 @@ export async function createBackend({ canvas, fail }) {
     gl.useProgram(progThick);
     bindTex(0, cur.pos, progThick, 'uPos');
     bindTex(1, cur.vel, progThick, 'uVel');
+    // Occlusion vs the RAW water depth: at true stream pixels this culls the
+    // pool behind, while pixels between sparse droplets keep their pool
+    // contribution (the blurred depth's near-clamped halo would fake holes).
+    bindTex(2, RT.waterDepth, progThick, 'uFront');
     gl.uniformMatrix4fv(u(progThick, 'uProj'), false, proj);
     gl.uniformMatrix4fv(u(progThick, 'uView'), false, view);
     gl.uniform1f(u(progThick, 'uPointScale'), RT.hh * proj[5]);
