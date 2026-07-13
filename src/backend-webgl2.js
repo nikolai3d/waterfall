@@ -112,7 +112,8 @@ export async function createBackend({ canvas, fail }) {
   let GTEX = 0;
   let progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG, progPoints,
     progPointDepth, progThick, progBlur, progComposite, progBlit, progGizmo,
-    progVolBlur, progVolume, progVoxel, progVolUpscale;
+    progVolBlur, progVolume, progVoxel, progVolUpscale,
+    progPointDepthA, progThickA;
   let programs = [];
   let cur, nxt, gridA, gridB, gridAFBO, gridBFBO, densTex, densFBO,
     volDens, volDensFBO;
@@ -149,7 +150,7 @@ export async function createBackend({ canvas, fail }) {
     cfg = config;
     GTEX = gridLayout(cfg.GRID).GTEX;
 
-    const S = makeShaders({ GRID: cfg.GRID, PTEX: cfg.PTEX, LIFE: cfg.LIFE, ISO: cfg.ISO });
+    const S = makeShaders({ GRID: cfg.GRID, PTEX: cfg.PTEX, LIFE: cfg.LIFE, ISO: cfg.ISO, K: cfg.K });
     progP2G1 = compile(S.vsP2G1, S.fsScatter, 'p2g1');
     progP2G2 = compile(S.vsP2G2, S.fsScatter, 'p2g2');
     progDensity = compile(S.vsQuad, S.fsDensity, 'density');
@@ -167,9 +168,12 @@ export async function createBackend({ canvas, fail }) {
     progVolume = compile(S.vsQuad, S.fsVolume, 'volume');
     progVoxel = compile(S.vsQuad, S.fsVoxel, 'voxel');
     progVolUpscale = compile(S.vsQuad, S.fsVolUpscale, 'volUpscale');
+    progPointDepthA = compile(S.vsPointAniso, S.fsPointDepthAniso, 'pointDepthAniso');
+    progThickA = compile(S.vsPointAniso, S.fsThickAniso, 'thicknessAniso');
     programs = [progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG,
       progPoints, progPointDepth, progThick, progBlur, progComposite, progBlit,
-      progGizmo, progVolBlur, progVolume, progVoxel, progVolUpscale];
+      progGizmo, progVolBlur, progVolume, progVoxel, progVolUpscale,
+      progPointDepthA, progThickA];
 
     cur = makeParticleSet(cfg.initialData);
     nxt = makeParticleSet(cfg.initialData);
@@ -393,16 +397,23 @@ export async function createBackend({ canvas, fail }) {
       return;
     }
 
+    // Screen-space fluid path ('ssf' and 'aniso' — aniso swaps the depth and
+    // thickness splat programs for ellipsoid variants, everything else is
+    // identical).
+    const aniso = frame.mode === 'aniso';
+
     // 2. water surface depth (z-tested against the shared scene depth)
+    const pd = aniso ? progPointDepthA : progPointDepth;
     gl.bindFramebuffer(gl.FRAMEBUFFER, RT.waterFBO);
     gl.clearColor(0, 0, 0, 0); // 0 = no water
     gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.useProgram(progPointDepth);
-    bindTex(0, cur.pos, progPointDepth, 'uPos');
-    bindTex(1, cur.vel, progPointDepth, 'uVel');
-    gl.uniformMatrix4fv(u(progPointDepth, 'uProj'), false, proj);
-    gl.uniformMatrix4fv(u(progPointDepth, 'uView'), false, view);
-    gl.uniform1f(u(progPointDepth, 'uPointScale'), h * proj[5]);
+    gl.useProgram(pd);
+    bindTex(0, cur.pos, pd, 'uPos');
+    bindTex(1, cur.vel, pd, 'uVel');
+    gl.uniformMatrix4fv(u(pd, 'uProj'), false, proj);
+    gl.uniformMatrix4fv(u(pd, 'uView'), false, view);
+    gl.uniform1f(u(pd, 'uPointScale'), h * proj[5]);
+    if (aniso) gl.uniform1f(u(pd, 'uSizeMul'), 1.0);
     gl.drawArrays(gl.POINTS, 0, cfg.N);
     gl.disable(gl.DEPTH_TEST);
 
@@ -429,16 +440,18 @@ export async function createBackend({ canvas, fail }) {
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
-    gl.useProgram(progThick);
-    bindTex(0, cur.pos, progThick, 'uPos');
-    bindTex(1, cur.vel, progThick, 'uVel');
+    const tk = aniso ? progThickA : progThick;
+    gl.useProgram(tk);
+    bindTex(0, cur.pos, tk, 'uPos');
+    bindTex(1, cur.vel, tk, 'uVel');
     // Occlusion vs the RAW water depth: at true stream pixels this culls the
     // pool behind, while pixels between sparse droplets keep their pool
     // contribution (the blurred depth's near-clamped halo would fake holes).
-    bindTex(2, RT.waterDepth, progThick, 'uFront');
-    gl.uniformMatrix4fv(u(progThick, 'uProj'), false, proj);
-    gl.uniformMatrix4fv(u(progThick, 'uView'), false, view);
-    gl.uniform1f(u(progThick, 'uPointScale'), RT.hh * proj[5]);
+    bindTex(2, RT.waterDepth, tk, 'uFront');
+    gl.uniformMatrix4fv(u(tk, 'uProj'), false, proj);
+    gl.uniformMatrix4fv(u(tk, 'uView'), false, view);
+    gl.uniform1f(u(tk, 'uPointScale'), RT.hh * proj[5]);
+    if (aniso) gl.uniform1f(u(tk, 'uSizeMul'), 1.7); // THICK_MUL
     gl.drawArrays(gl.POINTS, 0, cfg.N);
     gl.disable(gl.BLEND);
 

@@ -79,6 +79,17 @@ ones, and the thickness pass culls water well behind the visible surface
 through the stream in front of it nor punches fake holes around it.
 Use `?r=points` (or cycle with **f**) for the raw shaded-particle view.
 
+`?r=aniso` upgrades the same screen-space pipeline with **anisotropic
+ellipsoid splats** (after Yu & Turk, ACM TOG 2013): each particle's splat
+stretches along its velocity direction (elongation `1 + k·min(speed/VMAX, 1)`,
+tuned with `?k=` and ramped in over a particle's first moments so fresh spout
+spray doesn't streak) while the minor axes shrink to conserve volume, and the
+depth/thickness fragments intersect the oriented ellipsoid instead of a
+sphere — so thin sheets and streams reconstruct smoothly from far fewer
+visible bumps (most noticeable at low particle counts, e.g. 64³/192²). The
+blur, thickness accumulation, occlusion, and composite stages are shared
+with `ssf` unchanged; `?k=0` reduces exactly to the spherical splats.
+
 `?r=volume` instead raymarches the simulation's own density grid as a true
 3D volume: a fragment shader marches the (tent-blurred) grid mass to an
 iso-surface, refines the hit by bisection, shades with a density-gradient
@@ -108,9 +119,10 @@ renderer's blurred density field and scaled target (`?rscale=`).
 | `s`    | `g` / 32   | simulation substeps per frame                      |
 | `l`    | 2600       | particle lifetime in substeps (spout recycling)    |
 | `warm` | 0          | substeps to pre-simulate before the first frame    |
-| `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume`, `voxel` |
+| `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume`, `voxel`, `aniso` |
 | `rscale`| 0.5       | offscreen target scale for `r=volume`/`r=voxel` (0.1–1) |
 | `iso`  | 1.5        | solid-cell density threshold for `r=voxel` (0.1–16) |
+| `k`    | 1.5        | splat elongation gain for `r=aniso` (0–4)          |
 | `api`  | auto       | backend: `webgpu` or `webgl2` (auto-detects)       |
 | `bench`| off        | time N frames after warmup, then freeze + report   |
 | `dbg`  | off        | overlay with GPU-readback particle statistics      |

@@ -33,9 +33,13 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
   Both volume and voxel render offscreen at `?rscale=` (default 0.5, valid
   0.1–1). Voxel's solid-cell density threshold is `?iso=` (default 1.5,
   valid 0.1–16; garbage or out-of-range falls back to the default).
+- `?r=aniso` exercises the anisotropic-ellipsoid variant of the SSF splats
+  (same blur/thickness/composite pipeline); its elongation gain is `?k=`
+  (default 1.5, valid 0–4; garbage or out-of-range falls back to the
+  default, and `?k=0` looks like `r=ssf`).
 - The stats line shows the active render mode (and, in volume/voxel modes,
-  the effective `rscale=`; in voxel mode also `iso=`) — assert on it in
-  harnesses to confirm a mode/param took effect.
+  the effective `rscale=`; in voxel mode also `iso=`; in aniso mode `k=`) —
+  assert on it in harnesses to confirm a mode/param took effect.
 - macOS has no `timeout` command.
 
 ## Driving the UI (clicks) headlessly
