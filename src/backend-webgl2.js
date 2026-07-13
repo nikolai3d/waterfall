@@ -1,0 +1,426 @@
+// WebGL2 backend — MLS-MPM simulation in float textures.
+//
+// Pipeline per substep (all on GPU, particle/grid state in float textures):
+//   1. P2G-1  scatter mass + momentum to the grid (additive point rendering)
+//   2. density  per-particle density/pressure via weakly compressible EOS
+//   3. P2G-2  scatter pressure + viscosity forces to the grid
+//   4. grid   momentum -> velocity, gravity, boundary conditions
+//   5. G2P    gather velocity + affine matrix, advect, spawn/recycle
+//
+// Scatter is emulated by rendering one GL point per (particle, cell) pair
+// with additive blending; the 3D grid is tiled into a 2D texture.
+
+import { makeShaders, gridLayout } from './shaders.js';
+
+export async function createBackend({ canvas, fail }) {
+  const gl = canvas.getContext('webgl2', { antialias: true, alpha: false, depth: true });
+  if (!gl) fail('WebGL2 is not available in this browser.');
+  if (!gl.getExtension('EXT_color_buffer_float')) fail('Missing EXT_color_buffer_float (cannot render to float textures).');
+  if (!gl.getExtension('EXT_float_blend')) fail('Missing EXT_float_blend (cannot blend into float textures).');
+  if (gl.getParameter(gl.MAX_DRAW_BUFFERS) < 5) fail('Need at least 5 draw buffers.');
+
+  // -------------------------------------------------------------------------
+  // GL helpers
+
+  function compile(vsSrc, fsSrc, label) {
+    const mk = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        fail(`${label} ${type === gl.VERTEX_SHADER ? 'VS' : 'FS'}: ${gl.getShaderInfoLog(s)}`);
+      }
+      return s;
+    };
+    const p = gl.createProgram();
+    gl.attachShader(p, mk(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(p, mk(gl.FRAGMENT_SHADER, fsSrc));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      fail(`${label} link: ${gl.getProgramInfoLog(p)}`);
+    }
+    return p;
+  }
+
+  const uniformCache = new Map();
+  function u(prog, name) {
+    let m = uniformCache.get(prog);
+    if (!m) { m = new Map(); uniformCache.set(prog, m); }
+    if (!m.has(name)) m.set(name, gl.getUniformLocation(prog, name));
+    return m.get(name);
+  }
+
+  function createTex(w, h, data = null, internal = gl.RGBA32F, filter = gl.NEAREST) {
+    const fmt = {
+      [gl.RGBA32F]: [gl.RGBA, gl.FLOAT],
+      [gl.R32F]: [gl.RED, gl.FLOAT],
+      [gl.RG16F]: [gl.RG, gl.HALF_FLOAT],
+      [gl.RGBA8]: [gl.RGBA, gl.UNSIGNED_BYTE],
+    }[internal];
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, fmt[0], fmt[1], data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+
+  function createDepthTex(w, h) {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, w, h, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+
+  function createFBO(textures, depthTex = null) {
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    const bufs = textures.map((t, i) => {
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0);
+      return gl.COLOR_ATTACHMENT0 + i;
+    });
+    gl.drawBuffers(bufs);
+    if (depthTex) {
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depthTex, 0);
+    }
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      fail('Framebuffer incomplete (float render targets unsupported?).');
+    }
+    return f;
+  }
+
+  function bindTex(unit, tex, prog, name) {
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(u(prog, name), unit);
+  }
+
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+
+  // -------------------------------------------------------------------------
+  // Simulation state (programs + textures bake GRID/PTEX/LIFE in, so all of
+  // it is torn down and rebuilt by init when the panel changes a parameter).
+
+  let cfg = null;
+  let GTEX = 0;
+  let progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG, progPoints,
+    progPointDepth, progThick, progBlur, progComposite, progBlit, progGizmo;
+  let programs = [];
+  let cur, nxt, gridA, gridB, gridAFBO, gridBFBO, densTex, densFBO;
+  let substepCount = 0;
+
+  function makeParticleSet(posData) {
+    const pos = createTex(cfg.PTEX, cfg.PTEX, posData);
+    const vel = createTex(cfg.PTEX, cfg.PTEX);
+    const c0 = createTex(cfg.PTEX, cfg.PTEX);
+    const c1 = createTex(cfg.PTEX, cfg.PTEX);
+    const c2 = createTex(cfg.PTEX, cfg.PTEX);
+    const fbo = createFBO([pos, vel, c0, c1, c2]);
+    return { pos, vel, c0, c1, c2, fbo };
+  }
+
+  function deleteParticleSet(set) {
+    gl.deleteFramebuffer(set.fbo);
+    for (const t of [set.pos, set.vel, set.c0, set.c1, set.c2]) gl.deleteTexture(t);
+  }
+
+  function teardownSim() {
+    if (!programs.length) return;
+    for (const p of programs) gl.deleteProgram(p);
+    programs = [];
+    uniformCache.clear();
+    deleteParticleSet(cur);
+    deleteParticleSet(nxt);
+    for (const t of [gridA, gridB, densTex]) gl.deleteTexture(t);
+    for (const f of [gridAFBO, gridBFBO, densFBO]) gl.deleteFramebuffer(f);
+  }
+
+  function init(config) {
+    teardownSim();
+    cfg = config;
+    GTEX = gridLayout(cfg.GRID).GTEX;
+
+    const S = makeShaders({ GRID: cfg.GRID, PTEX: cfg.PTEX, LIFE: cfg.LIFE });
+    progP2G1 = compile(S.vsP2G1, S.fsScatter, 'p2g1');
+    progP2G2 = compile(S.vsP2G2, S.fsScatter, 'p2g2');
+    progDensity = compile(S.vsQuad, S.fsDensity, 'density');
+    progGrid = compile(S.vsQuad, S.fsGrid, 'grid');
+    progG2P = compile(S.vsQuad, S.fsG2P, 'g2p');
+    progBG = compile(S.vsQuad, S.fsBackground, 'background');
+    progPoints = compile(S.vsPoint, S.fsPoint, 'points');
+    progPointDepth = compile(S.vsPoint, S.fsPointDepth, 'pointDepth');
+    progThick = compile(S.vsThick, S.fsThick, 'thickness');
+    progBlur = compile(S.vsQuad, S.fsBlur, 'blur');
+    progComposite = compile(S.vsQuad, S.fsComposite, 'composite');
+    progBlit = compile(S.vsQuad, S.fsBlit, 'blit');
+    progGizmo = compile(S.vsGizmo, S.fsGizmo, 'gizmo');
+    programs = [progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG,
+      progPoints, progPointDepth, progThick, progBlur, progComposite, progBlit,
+      progGizmo];
+
+    cur = makeParticleSet(cfg.initialData);
+    nxt = makeParticleSet(cfg.initialData);
+
+    gridA = createTex(GTEX, GTEX); // scatter target (momentum, mass)
+    gridB = createTex(GTEX, GTEX); // updated velocities
+    gridAFBO = createFBO([gridA]);
+    gridBFBO = createFBO([gridB]);
+
+    densTex = createTex(cfg.PTEX, cfg.PTEX);
+    densFBO = createFBO([densTex]);
+
+    substepCount = 0;
+  }
+
+  // Screen-space fluid rendering targets (recreated on resize).
+  let RT = null;
+
+  function createTargets(w, h) {
+    if (RT) {
+      for (const t of RT.textures) gl.deleteTexture(t);
+      for (const f of RT.fbos) gl.deleteFramebuffer(f);
+    }
+    const hw = Math.max(1, Math.ceil(w / 2));
+    const hh = Math.max(1, Math.ceil(h / 2));
+    const sceneColor = createTex(w, h, null, gl.RGBA8, gl.LINEAR);
+    const depthTex = createDepthTex(w, h);
+    const waterDepth = createTex(w, h, null, gl.R32F);
+    const blurA = createTex(w, h, null, gl.R32F);
+    const blurB = createTex(w, h, null, gl.R32F);
+    const thick = createTex(hw, hh, null, gl.RG16F, gl.LINEAR);
+    RT = {
+      w, h, hw, hh,
+      sceneColor, waterDepth, blurA, blurB, thick,
+      sceneFBO: createFBO([sceneColor], depthTex),
+      waterFBO: createFBO([waterDepth], depthTex), // shares the scene depth
+      blurAFBO: createFBO([blurA]),
+      blurBFBO: createFBO([blurB]),
+      thickFBO: createFBO([thick]),
+      textures: [sceneColor, depthTex, waterDepth, blurA, blurB, thick],
+      fbos: [],
+    };
+    RT.fbos = [RT.sceneFBO, RT.waterFBO, RT.blurAFBO, RT.blurBFBO, RT.thickFBO];
+  }
+
+  // -------------------------------------------------------------------------
+  // Simulation substep
+
+  function substep() {
+    gl.disable(gl.DEPTH_TEST);
+
+    // 1. clear grid + P2G-1
+    gl.bindFramebuffer(gl.FRAMEBUFFER, gridAFBO);
+    gl.viewport(0, 0, GTEX, GTEX);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(progP2G1);
+    bindTex(0, cur.pos, progP2G1, 'uPos');
+    bindTex(1, cur.vel, progP2G1, 'uVel');
+    bindTex(2, cur.c0, progP2G1, 'uC0');
+    bindTex(3, cur.c1, progP2G1, 'uC1');
+    bindTex(4, cur.c2, progP2G1, 'uC2');
+    gl.drawArrays(gl.POINTS, 0, cfg.N * 27);
+    gl.disable(gl.BLEND);
+
+    // 2. density / pressure
+    gl.bindFramebuffer(gl.FRAMEBUFFER, densFBO);
+    gl.viewport(0, 0, cfg.PTEX, cfg.PTEX);
+    gl.useProgram(progDensity);
+    bindTex(0, cur.pos, progDensity, 'uPos');
+    bindTex(1, gridA, progDensity, 'uGrid');
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // 3. P2G-2 (forces, additive into the same grid)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, gridAFBO);
+    gl.viewport(0, 0, GTEX, GTEX);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(progP2G2);
+    bindTex(0, cur.pos, progP2G2, 'uPos');
+    bindTex(1, cur.c0, progP2G2, 'uC0');
+    bindTex(2, cur.c1, progP2G2, 'uC1');
+    bindTex(3, cur.c2, progP2G2, 'uC2');
+    bindTex(4, densTex, progP2G2, 'uAux');
+    gl.drawArrays(gl.POINTS, 0, cfg.N * 27);
+    gl.disable(gl.BLEND);
+
+    // 4. grid update
+    gl.bindFramebuffer(gl.FRAMEBUFFER, gridBFBO);
+    gl.viewport(0, 0, GTEX, GTEX);
+    gl.useProgram(progGrid);
+    bindTex(0, gridA, progGrid, 'uGrid');
+    gl.uniform4fv(u(progGrid, 'uRocks'), cfg.rockData);
+    gl.uniform3fv(u(progGrid, 'uRockVel'), cfg.rockVel);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    // 5. G2P + advect
+    gl.bindFramebuffer(gl.FRAMEBUFFER, nxt.fbo);
+    gl.viewport(0, 0, cfg.PTEX, cfg.PTEX);
+    gl.useProgram(progG2P);
+    bindTex(0, cur.pos, progG2P, 'uPos');
+    bindTex(1, gridB, progG2P, 'uGrid');
+    gl.uniform4fv(u(progG2P, 'uRocks'), cfg.rockData);
+    gl.uniform1f(u(progG2P, 'uFrame'), substepCount);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    [cur, nxt] = [nxt, cur];
+    substepCount++;
+  }
+
+  // -------------------------------------------------------------------------
+  // Rendering
+
+  // Wireframe drag gizmo overlay: ghost circle at the grab origin, line to
+  // the current center, circle there. Drawn last, no depth test.
+  function drawGizmo(frame) {
+    if (!frame.gizmo) return;
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(progGizmo);
+    gl.uniformMatrix4fv(u(progGizmo, 'uPV'), false, frame.pv);
+    gl.uniform3fv(u(progGizmo, 'uA'), frame.gizmo.a);
+    gl.uniform3fv(u(progGizmo, 'uB'), frame.gizmo.b);
+    gl.uniform3fv(u(progGizmo, 'uCamR'), frame.right);
+    gl.uniform3fv(u(progGizmo, 'uCamU'), frame.up);
+    gl.uniform1f(u(progGizmo, 'uR'), frame.gizmo.r);
+    gl.drawArrays(gl.LINES, 0, 130);
+    gl.disable(gl.BLEND);
+  }
+
+  function render(frame) {
+    const { w, h, proj, view, pv, aspect, lightV } = frame;
+    if (!RT || RT.w !== w || RT.h !== h) createTargets(w, h);
+
+    // 1. scene (cube walls + rocks) into offscreen color + depth
+    gl.bindFramebuffer(gl.FRAMEBUFFER, RT.sceneFBO);
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0.01, 0.015, 0.02, 1);
+    gl.clearDepth(1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LESS);
+    gl.useProgram(progBG);
+    gl.uniform3fv(u(progBG, 'uCamPos'), frame.eye);
+    gl.uniform3fv(u(progBG, 'uCamR'), frame.right);
+    gl.uniform3fv(u(progBG, 'uCamU'), frame.up);
+    gl.uniform3fv(u(progBG, 'uCamF'), frame.fwd);
+    gl.uniform2f(u(progBG, 'uRes'), w, h);
+    gl.uniform1f(u(progBG, 'uTanF'), frame.tanF);
+    gl.uniform1f(u(progBG, 'uAspect'), aspect);
+    gl.uniformMatrix4fv(u(progBG, 'uPV'), false, pv);
+    gl.uniform3fv(u(progBG, 'uLightW'), frame.lightW);
+    gl.uniform4fv(u(progBG, 'uRocks'), cfg.rockData);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    if (frame.mode === 'points') {
+      // Legacy view: shaded impostors straight into the scene, then blit.
+      gl.useProgram(progPoints);
+      bindTex(0, cur.pos, progPoints, 'uPos');
+      bindTex(1, cur.vel, progPoints, 'uVel');
+      gl.uniformMatrix4fv(u(progPoints, 'uProj'), false, proj);
+      gl.uniformMatrix4fv(u(progPoints, 'uView'), false, view);
+      gl.uniform1f(u(progPoints, 'uPointScale'), h * proj[5]);
+      gl.uniform3fv(u(progPoints, 'uLightV'), lightV);
+      gl.drawArrays(gl.POINTS, 0, cfg.N);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, w, h);
+      gl.disable(gl.DEPTH_TEST);
+      gl.useProgram(progBlit);
+      bindTex(0, RT.sceneColor, progBlit, 'uScene');
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      drawGizmo(frame);
+      return;
+    }
+
+    // 2. water surface depth (z-tested against the shared scene depth)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, RT.waterFBO);
+    gl.clearColor(0, 0, 0, 0); // 0 = no water
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(progPointDepth);
+    bindTex(0, cur.pos, progPointDepth, 'uPos');
+    bindTex(1, cur.vel, progPointDepth, 'uVel');
+    gl.uniformMatrix4fv(u(progPointDepth, 'uProj'), false, proj);
+    gl.uniformMatrix4fv(u(progPointDepth, 'uView'), false, view);
+    gl.uniform1f(u(progPointDepth, 'uPointScale'), h * proj[5]);
+    gl.drawArrays(gl.POINTS, 0, cfg.N);
+    gl.disable(gl.DEPTH_TEST);
+
+    // 3. depth-aware separable blur, two iterations
+    const scalePx = h * proj[5];
+    let src = RT.waterDepth;
+    for (const [fbo, tex, dx, dy] of [
+      [RT.blurAFBO, RT.blurA, 1, 0], [RT.blurBFBO, RT.blurB, 0, 1],
+      [RT.blurAFBO, RT.blurA, 1, 0], [RT.blurBFBO, RT.blurB, 0, 1],
+    ]) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.useProgram(progBlur);
+      bindTex(0, src, progBlur, 'uDepth');
+      gl.uniform2f(u(progBlur, 'uDir'), dx, dy);
+      gl.uniform1f(u(progBlur, 'uScalePx'), scalePx);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      src = tex;
+    }
+
+    // 4. thickness + foam, half resolution, additive
+    gl.bindFramebuffer(gl.FRAMEBUFFER, RT.thickFBO);
+    gl.viewport(0, 0, RT.hw, RT.hh);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(progThick);
+    bindTex(0, cur.pos, progThick, 'uPos');
+    bindTex(1, cur.vel, progThick, 'uVel');
+    gl.uniformMatrix4fv(u(progThick, 'uProj'), false, proj);
+    gl.uniformMatrix4fv(u(progThick, 'uView'), false, view);
+    gl.uniform1f(u(progThick, 'uPointScale'), RT.hh * proj[5]);
+    gl.drawArrays(gl.POINTS, 0, cfg.N);
+    gl.disable(gl.BLEND);
+
+    // 5. composite to the canvas
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, w, h);
+    gl.useProgram(progComposite);
+    bindTex(0, RT.sceneColor, progComposite, 'uScene');
+    bindTex(1, src, progComposite, 'uDepthS');
+    bindTex(2, RT.thick, progComposite, 'uThick');
+    gl.uniform2f(u(progComposite, 'uRes'), w, h);
+    gl.uniform1f(u(progComposite, 'uTanF'), frame.tanF);
+    gl.uniform1f(u(progComposite, 'uAspect'), aspect);
+    gl.uniform3fv(u(progComposite, 'uLightV'), lightV);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    drawGizmo(frame);
+  }
+
+  function readParticles() {
+    const P = cfg.PTEX;
+    const buf = new Float32Array(P * P * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, cur.fbo);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    gl.readPixels(0, 0, P, P, gl.RGBA, gl.FLOAT, buf);
+    return buf;
+  }
+
+  function dispose() {
+    teardownSim();
+    if (RT) {
+      for (const t of RT.textures) gl.deleteTexture(t);
+      for (const f of RT.fbos) gl.deleteFramebuffer(f);
+      RT = null;
+    }
+    gl.deleteVertexArray(vao);
+  }
+
+  return { name: 'webgl2', init, substep, render, readParticles, dispose };
+}
