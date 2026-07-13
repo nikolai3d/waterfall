@@ -87,6 +87,17 @@ Beer–Lambert absorption from the marched density — to the analytic
 walls-and-rocks background, with foam from the grid's momentum magnitude;
 it renders at a reduced resolution (`?rscale=`, default 0.5) and upscales.
 
+`?r=voxel` renders that same density grid as literal grid-aligned cubes
+(a deliberately chunky, Minecraft-water look that exposes the simulation's
+actual data structure): a DDA raycast (Amanatides & Woo) walks each ray
+through the cells and the first cell above the `?iso=` density threshold is
+a cube-face hit with an axis-aligned normal — so the voxel size visibly
+tracks the grid chip. Faces get flat per-face diffuse (tops lighter),
+cell-edge darkening, whitecaps where a cell's momentum/mass is high, and
+one refracted continuation ray (also DDA) that Beer–Lambert-attenuates the
+analytic background by the water path length. It shares the volume
+renderer's blurred density field and scaled target (`?rscale=`).
+
 ## URL parameters
 
 | param  | default    | meaning                                            |
@@ -96,8 +107,9 @@ it renders at a reduced resolution (`?rscale=`, default 0.5) and upscales.
 | `s`    | `g` / 32   | simulation substeps per frame                      |
 | `l`    | 2600       | particle lifetime in substeps (spout recycling)    |
 | `warm` | 0          | substeps to pre-simulate before the first frame    |
-| `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume` |
-| `rscale`| 0.5       | offscreen target scale for `r=volume` (0.1–1)      |
+| `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume`, `voxel` |
+| `rscale`| 0.5       | offscreen target scale for `r=volume`/`r=voxel` (0.1–1) |
+| `iso`  | 1.5        | solid-cell density threshold for `r=voxel` (0.1–16) |
 | `api`  | auto       | backend: `webgpu` or `webgl2` (auto-detects)       |
 | `bench`| off        | time N frames after warmup, then freeze + report   |
 | `dbg`  | off        | overlay with GPU-readback particle statistics      |

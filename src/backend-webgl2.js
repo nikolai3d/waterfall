@@ -112,7 +112,7 @@ export async function createBackend({ canvas, fail }) {
   let GTEX = 0;
   let progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG, progPoints,
     progPointDepth, progThick, progBlur, progComposite, progBlit, progGizmo,
-    progVolBlur, progVolume, progVolUpscale;
+    progVolBlur, progVolume, progVoxel, progVolUpscale;
   let programs = [];
   let cur, nxt, gridA, gridB, gridAFBO, gridBFBO, densTex, densFBO,
     volDens, volDensFBO;
@@ -149,7 +149,7 @@ export async function createBackend({ canvas, fail }) {
     cfg = config;
     GTEX = gridLayout(cfg.GRID).GTEX;
 
-    const S = makeShaders({ GRID: cfg.GRID, PTEX: cfg.PTEX, LIFE: cfg.LIFE });
+    const S = makeShaders({ GRID: cfg.GRID, PTEX: cfg.PTEX, LIFE: cfg.LIFE, ISO: cfg.ISO });
     progP2G1 = compile(S.vsP2G1, S.fsScatter, 'p2g1');
     progP2G2 = compile(S.vsP2G2, S.fsScatter, 'p2g2');
     progDensity = compile(S.vsQuad, S.fsDensity, 'density');
@@ -165,10 +165,11 @@ export async function createBackend({ canvas, fail }) {
     progGizmo = compile(S.vsGizmo, S.fsGizmo, 'gizmo');
     progVolBlur = compile(S.vsQuad, S.fsVolBlur, 'volBlur');
     progVolume = compile(S.vsQuad, S.fsVolume, 'volume');
+    progVoxel = compile(S.vsQuad, S.fsVoxel, 'voxel');
     progVolUpscale = compile(S.vsQuad, S.fsVolUpscale, 'volUpscale');
     programs = [progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG,
       progPoints, progPointDepth, progThick, progBlur, progComposite, progBlit,
-      progGizmo, progVolBlur, progVolume, progVolUpscale];
+      progGizmo, progVolBlur, progVolume, progVoxel, progVolUpscale];
 
     cur = makeParticleSet(cfg.initialData);
     nxt = makeParticleSet(cfg.initialData);
@@ -314,9 +315,9 @@ export async function createBackend({ canvas, fail }) {
     const { w, h, proj, view, pv, aspect, lightV } = frame;
     if (!RT || RT.w !== w || RT.h !== h) createTargets(w, h);
 
-    if (frame.mode === 'volume') {
-      // Volumetric raymarch: tent-blur the grid density, raymarch it into a
-      // scaled offscreen target, then upscale to the canvas.
+    if (frame.mode === 'volume' || frame.mode === 'voxel') {
+      // Volumetric raymarch / voxel DDA: tent-blur the grid density, trace
+      // it into a scaled offscreen target, then upscale to the canvas.
       gl.disable(gl.DEPTH_TEST);
       gl.bindFramebuffer(gl.FRAMEBUFFER, volDensFBO);
       gl.viewport(0, 0, GTEX, GTEX);
@@ -324,19 +325,20 @@ export async function createBackend({ canvas, fail }) {
       bindTex(0, gridB, progVolBlur, 'uGrid');
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
+      const prog = frame.mode === 'voxel' ? progVoxel : progVolume;
       gl.bindFramebuffer(gl.FRAMEBUFFER, RT.volFBO);
       gl.viewport(0, 0, RT.volW, RT.volH);
-      gl.useProgram(progVolume);
-      bindTex(0, volDens, progVolume, 'uDens');
-      gl.uniform3fv(u(progVolume, 'uCamPos'), frame.eye);
-      gl.uniform3fv(u(progVolume, 'uCamR'), frame.right);
-      gl.uniform3fv(u(progVolume, 'uCamU'), frame.up);
-      gl.uniform3fv(u(progVolume, 'uCamF'), frame.fwd);
-      gl.uniform2f(u(progVolume, 'uRes'), RT.volW, RT.volH);
-      gl.uniform1f(u(progVolume, 'uTanF'), frame.tanF);
-      gl.uniform1f(u(progVolume, 'uAspect'), aspect);
-      gl.uniform3fv(u(progVolume, 'uLightW'), frame.lightW);
-      gl.uniform4fv(u(progVolume, 'uRocks'), cfg.rockData);
+      gl.useProgram(prog);
+      bindTex(0, volDens, prog, 'uDens');
+      gl.uniform3fv(u(prog, 'uCamPos'), frame.eye);
+      gl.uniform3fv(u(prog, 'uCamR'), frame.right);
+      gl.uniform3fv(u(prog, 'uCamU'), frame.up);
+      gl.uniform3fv(u(prog, 'uCamF'), frame.fwd);
+      gl.uniform2f(u(prog, 'uRes'), RT.volW, RT.volH);
+      gl.uniform1f(u(prog, 'uTanF'), frame.tanF);
+      gl.uniform1f(u(prog, 'uAspect'), aspect);
+      gl.uniform3fv(u(prog, 'uLightW'), frame.lightW);
+      gl.uniform4fv(u(prog, 'uRocks'), cfg.rockData);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
