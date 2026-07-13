@@ -9,6 +9,12 @@ export const ROCKS = [
   [39.0, 3.5, 33.0, 4.0],
 ];
 
+// Shared splat-tuning constants, template-interpolated into BOTH shader
+// languages (wgsl.js imports these) so a retune cannot desynchronize the
+// backends or the depth/thickness normalization.
+export const THICK_MUL = 1.7; // thickness splat footprint vs the depth splat
+export const ANISO_AGE = 24;  // substeps to ramp in aniso elongation
+
 // z-slice tiling of the 3D grid into a 2D texture. TILES² ≥ GRID; unused
 // tiles are never addressed (gridTexel only sees z < GRID).
 export function gridLayout(GRID) {
@@ -419,7 +425,7 @@ void main() {
   vec3 wp = pa.xyz * (2.0 / GRIDF) - 1.0;
   vec4 vp = uView * vec4(wp, 1.0);
   gl_Position = uProj * vp;
-  gl_PointSize = clamp(uPointScale * PRADIUS * 1.7 / max(-vp.z, 0.05), 1.0, 96.0);
+  gl_PointSize = clamp(uPointScale * PRADIUS * ${THICK_MUL.toFixed(4)} / max(-vp.z, 0.05), 1.0, 96.0);
   vSpeed = texelFetch(uVel, pt, 0).w / VMAX;
   vZ = -vp.z;
 }
@@ -463,16 +469,18 @@ void main() {
   // spherical impostors already make). Point sprites are square, so the
   // sprite size is the max of the projected ellipse's per-axis extents.
   const anisoConsts = `
-const float ANISO_K = ${K.toFixed(4)};   // ?k= elongation gain
-const float ANISO_AGE = 24.0;            // substeps to ramp in elongation
-const float THICK_MUL = 1.7;             // thickness footprint (matches vsThick)
+const float ANISO_K = ${K.toFixed(4)};            // ?k= elongation gain
+const float ANISO_AGE = ${ANISO_AGE.toFixed(1)};  // substeps to ramp in elongation
+const float THICK_MUL = ${THICK_MUL.toFixed(4)};  // thickness footprint (shared with vsThick)
 `;
 
-  const vsPointAniso = header + anisoConsts + `
+  // Two VS variants are generated (like the WGSL entry points): the depth
+  // pass at the plain radius, the thickness pass at the THICK_MUL footprint.
+  const makeVsAniso = (sizeMul) => header + anisoConsts + `
 uniform sampler2D uPos, uVel;
 uniform mat4 uProj, uView;
 uniform float uPointScale;
-uniform float uSizeMul; // 1.0 for the depth pass, THICK_MUL for thickness
+const float SIZE_MUL = ${sizeMul.toFixed(4)}; // 1.0 for depth, THICK_MUL for thickness
 flat out vec3 vCenterV;
 // Rows of the inverse semi-axis matrix, pre-multiplied so that
 // n = q.x*vQx + q.y*vQy + zoff*vQz is the ellipsoid-normalized coordinate.
@@ -503,8 +511,8 @@ void main() {
   vec3 refv = abs(axis.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
   vec3 m1 = normalize(cross(axis, refv));
   vec3 m2 = cross(axis, m1);
-  float ra = PRADIUS * elong * uSizeMul;              // major semi-axis
-  float rb = PRADIUS * inversesqrt(elong) * uSizeMul; // minors conserve volume
+  float ra = PRADIUS * elong * SIZE_MUL;              // major semi-axis
+  float rb = PRADIUS * inversesqrt(elong) * SIZE_MUL; // minors conserve volume
 
   // Conservative sprite: exact orthographic extents of the projected
   // ellipse per screen axis (row norms of the semi-axis matrix).
@@ -524,6 +532,9 @@ void main() {
   vZ = z;
 }
 `;
+
+  const vsPointDepthAniso = makeVsAniso(1.0);
+  const vsThickAniso = makeVsAniso(THICK_MUL);
 
   // Depth pass: intersect the view ray (approximated as -z through the
   // fragment) with the ellipsoid — a unit sphere in normalized space.
@@ -1237,7 +1248,7 @@ void main() {
     vsQuad, vsP2G1, vsP2G2, fsScatter, fsDensity, fsGrid, fsG2P,
     vsPoint, fsPoint, fsBackground,
     fsPointDepth, vsThick, fsThick, fsBlur, fsComposite, fsBlit,
-    vsPointAniso, fsPointDepthAniso, fsThickAniso,
+    vsPointDepthAniso, vsThickAniso, fsPointDepthAniso, fsThickAniso,
     fsVolBlur, fsVolume, fsVoxel, fsVolUpscale,
     vsGizmo, fsGizmo,
   };

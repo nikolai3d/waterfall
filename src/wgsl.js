@@ -5,7 +5,7 @@
 // point amplification), and particle state lives in SoA storage buffers
 // updated in place. All constants are baked per config like the GLSL header.
 
-import { ROCKS } from './shaders.js';
+import { ROCKS, THICK_MUL, ANISO_AGE } from './shaders.js';
 
 export function makeWGSL(opts) {
   const { GRID, LIFE, N, ISO, K } = opts; // ISO/K validated/defaulted in app.js
@@ -567,7 +567,7 @@ fn fsPointDepth(v: PointVSOut) -> DepthOut {
 // R = thickness, G = speed-weighted thickness (average speed -> foam).
 @vertex
 fn vsThick(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PointVSOut {
-  return pointVS(vi, ii, R.misc.y, 1.7);
+  return pointVS(vi, ii, R.misc.y, ${THICK_MUL.toFixed(4)});
 }
 
 @fragment
@@ -640,9 +640,9 @@ fn fsGizmo(v: GizmoOut) -> @location(0) vec4f {
   // within the splat (the same orthographic-silhouette approximation the
   // spherical impostors already make).
   const renderAniso = `
-const ANISO_K: f32 = ${K.toFixed(4)};   // ?k= elongation gain
-const ANISO_AGE: f32 = 24.0;            // substeps to ramp in elongation
-const THICK_MUL: f32 = 1.7;             // thickness footprint (matches vsThick)
+const ANISO_K: f32 = ${K.toFixed(4)};             // ?k= elongation gain
+const ANISO_AGE: f32 = ${ANISO_AGE.toFixed(1)};   // substeps to ramp in elongation
+const THICK_MUL: f32 = ${THICK_MUL.toFixed(4)};   // thickness footprint (shared with vsThick)
 
 struct AnisoVSOut {
   @builtin(position) pos: vec4f,
