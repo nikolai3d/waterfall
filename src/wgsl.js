@@ -306,7 +306,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
   // Render module. NOTE: the backend pre-converts projection matrices to
   // WebGPU's [0,1] clip z, so frag depth is clip.z / clip.w directly.
 
-  const renderCommon = common + `
+  const renderUStruct = `
 struct RenderU {
   pv: mat4x4f,
   proj: mat4x4f,
@@ -322,6 +322,9 @@ struct RenderU {
   rocks: array<vec4f, ${NROCK}>, // grid units
   gizmo: array<vec4f, 3>,        // a.xyz + active, b.xyz + radius, unused
 };
+`;
+
+  const renderCommon = common + renderUStruct + `
 @group(0) @binding(0) var<uniform> R: RenderU;
 @group(0) @binding(1) var<storage, read> pos: array<vec4f>;
 @group(0) @binding(2) var<storage, read> vel: array<vec4f>;
@@ -516,8 +519,240 @@ fn fsPoints(v: PointVSOut) -> PointOut {
 }
 `;
 
+  // --- Screen-space fluid rendering ---------------------------------------
+
+  // Depth pass: same impostors, but output linear view-space depth to an
+  // r32float target (0 = no water); frag depth still set for the z-test
+  // against the raytraced scene sharing the depth attachment.
+  const renderSSF = `
+struct DepthOut {
+  @location(0) col: vec4f,
+  @builtin(frag_depth) depth: f32,
+};
+
+@fragment
+fn fsPointDepth(v: PointVSOut) -> DepthOut {
+  let q = v.q;
+  let r2 = dot(q, q);
+  if (r2 > 1.0) { discard; }
+  let fp = v.centerV + vec3f(q, sqrt(1.0 - r2)) * PRADIUS;
+  let clip = R.proj * vec4f(fp, 1.0);
+  var o: DepthOut;
+  o.depth = clamp(clip.z / clip.w, 0.0, 1.0);
+  o.col = vec4f(-fp.z, 0.0, 0.0, 1.0);
+  return o;
+}
+
+// Thickness pass: soft additive sprites into a half-res rg16float target.
+// R = thickness, G = speed-weighted thickness (average speed -> foam).
+@vertex
+fn vsThick(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PointVSOut {
+  return pointVS(vi, ii, R.misc.y, 1.7);
+}
+
+@fragment
+fn fsThick(v: PointVSOut) -> @location(0) vec4f {
+  let q = v.q;
+  let r2 = dot(q, q);
+  if (r2 > 1.0) { discard; }
+  let f = 1.0 - r2;
+  let th = f * f * PRADIUS * 2.0;
+  return vec4f(th, th * v.speed, 0.0, 1.0);
+}
+
+// Drag gizmo: attribute-less wireframe delta indicator (line + billboard
+// circles), 130 vertices as line-list.
+struct GizmoOut {
+  @builtin(position) pos: vec4f,
+  @location(0) @interpolate(flat) ghost: f32,
+};
+
+@vertex
+fn vsGizmo(@builtin(vertex_index) vi: u32) -> GizmoOut {
+  var o: GizmoOut;
+  let A = R.gizmo[0].xyz;
+  let Bc = R.gizmo[1].xyz;
+  let rad = R.gizmo[1].w;
+  var p: vec3f;
+  if (vi < 2u) {
+    p = select(Bc, A, vi == 0u);
+    o.ghost = 0.0;
+  } else {
+    let seg = i32(vi - 2u) / 2;
+    let circle = seg / 32;
+    let a = 6.2831853 * f32(seg % 32 + i32((vi - 2u) & 1u)) / 32.0;
+    var c = A;
+    var g = 1.0;
+    if (circle == 1) { c = Bc; g = 0.0; }
+    p = c + (R.camR.xyz * cos(a) + R.camU.xyz * sin(a)) * rad;
+    o.ghost = g;
+  }
+  o.pos = R.pv * vec4f(p, 1.0);
+  return o;
+}
+
+@fragment
+fn fsGizmo(v: GizmoOut) -> @location(0) vec4f {
+  if (v.ghost > 0.5) { return vec4f(0.55, 0.75, 0.95, 0.35); }
+  return vec4f(0.80, 0.92, 1.0, 0.9);
+}
+`;
+
+  // Separable depth-aware blur with the gap-fill closing (own module: it
+  // has its own binding namespace).
+  const blur = `
+struct BlurU {
+  dir: vec2f,     // (1,0) or (0,1), in texels
+  scalePx: f32,   // pixels per world unit at z = 1
+  _p: f32,
+};
+@group(0) @binding(0) var<uniform> BU: BlurU;
+@group(0) @binding(1) var srcTex: texture_2d<f32>;
+
+const NRANGE: f32 = 0.10; // reject neighbors further than this in depth
+
+@vertex
+fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+  return vec4f(p * 2.0 - vec2f(1.0), 0.0, 1.0);
+}
+
+fn dfetch(t: vec2i) -> f32 {
+  let s = vec2i(textureDimensions(srcTex));
+  return textureLoad(srcTex, clamp(t, vec2i(0), s - vec2i(1)), 0).r;
+}
+
+@fragment
+fn fsBlur(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+  let tx = vec2i(frag.xy);
+  let dir = vec2i(BU.dir);
+  var z0 = textureLoad(srcTex, tx, 0).r;
+
+  // Gap fill (morphological closing): fill a no-water pixel only when water
+  // lies on BOTH sides along this axis at a compatible depth, so droplets
+  // merge without inflating outer silhouettes.
+  if (z0 <= 0.0) {
+    var zp = 0.0;
+    var zm = 0.0;
+    var ip = 0;
+    var im = 0;
+    for (var i = 1; i <= 20; i++) {
+      if (zp <= 0.0) { zp = dfetch(tx + dir * i); ip = i; }
+      if (zm <= 0.0) { zm = dfetch(tx - dir * i); im = i; }
+    }
+    if (zp <= 0.0 || zm <= 0.0 || abs(zp - zm) > NRANGE) { return vec4f(0.0); }
+    z0 = min(zp, zm);
+    let reach = clamp(0.045 * BU.scalePx / z0, 2.0, 20.0);
+    if (f32(ip + im) > reach) { return vec4f(0.0); }
+  }
+
+  let radius = clamp(0.045 * BU.scalePx / z0, 2.0, 20.0);
+  var sum = z0;
+  var wsum = 1.0;
+  for (var i = 1; i <= 20; i++) {
+    let fi = f32(i);
+    if (fi > radius) { break; }
+    let g = exp(-fi * fi / (0.5 * radius * radius));
+    let za = dfetch(tx + dir * i);
+    let zb = dfetch(tx - dir * i);
+    if (za > 0.0 && abs(za - z0) < NRANGE) { sum += za * g; wsum += g; }
+    if (zb > 0.0 && abs(zb - z0) < NRANGE) { sum += zb * g; wsum += g; }
+  }
+  return vec4f(sum / wsum, 0.0, 0.0, 1.0);
+}
+`;
+
+  // Composite: reconstruct and shade the water surface over the scene
+  // (own module: samples textures the main render module does not bind).
+  const composite = common + renderUStruct + `
+@group(0) @binding(0) var<uniform> R: RenderU;
+@group(0) @binding(1) var sceneTex: texture_2d<f32>;
+@group(0) @binding(2) var linSamp: sampler;
+@group(0) @binding(3) var depthTexS: texture_2d<f32>;
+@group(0) @binding(4) var thickTex: texture_2d<f32>;
+
+@vertex
+fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+  return vec4f(p * 2.0 - vec2f(1.0), 0.0, 1.0);
+}
+
+fn viewRay(frag: vec2f) -> vec3f {
+  var uv = frag / R.res.xy * 2.0 - vec2f(1.0);
+  uv.y = -uv.y; // framebuffer y is top-down in WebGPU
+  return vec3f(uv.x * R.res.z * R.res.w, uv.y * R.res.z, -1.0);
+}
+
+fn dfetchS(t: vec2i) -> f32 {
+  let s = vec2i(textureDimensions(depthTexS));
+  return textureLoad(depthTexS, clamp(t, vec2i(0), s - vec2i(1)), 0).r;
+}
+
+fn viewPos(tx: vec2i, z: f32) -> vec3f {
+  return viewRay(vec2f(tx) + vec2f(0.5)) * z;
+}
+
+@fragment
+fn fsComposite(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+  let tx = vec2i(frag.xy);
+  let tuv = frag.xy / R.res.xy;
+  let scene = textureSampleLevel(sceneTex, linSamp, tuv, 0.0).rgb;
+  let z0 = textureLoad(depthTexS, tx, 0).r;
+  if (z0 <= 0.0) { return vec4f(scene, 1.0); }
+
+  let P = viewRay(frag.xy) * z0;
+
+  // Normal from finite differences, taking the smoother side on each axis.
+  var zx1 = dfetchS(tx + vec2i(1, 0));
+  if (zx1 <= 0.0 || abs(zx1 - z0) > 0.3) { zx1 = z0; }
+  var zx2 = dfetchS(tx - vec2i(1, 0));
+  if (zx2 <= 0.0 || abs(zx2 - z0) > 0.3) { zx2 = z0; }
+  var zy1 = dfetchS(tx + vec2i(0, 1));
+  if (zy1 <= 0.0 || abs(zy1 - z0) > 0.3) { zy1 = z0; }
+  var zy2 = dfetchS(tx - vec2i(0, 1));
+  if (zy2 <= 0.0 || abs(zy2 - z0) > 0.3) { zy2 = z0; }
+  var dx: vec3f;
+  var dy: vec3f;
+  if (abs(zx1 - z0) < abs(zx2 - z0)) { dx = viewPos(tx + vec2i(1, 0), zx1) - P; }
+  else { dx = P - viewPos(tx - vec2i(1, 0), zx2); }
+  if (abs(zy1 - z0) < abs(zy2 - z0)) { dy = viewPos(tx + vec2i(0, 1), zy1) - P; }
+  else { dy = P - viewPos(tx - vec2i(0, 1), zy2); }
+  var n = normalize(cross(dx, dy));
+  if (n.z < 0.0) { n = -n; }
+
+  let t2 = textureSampleLevel(thickTex, linSamp, tuv, 0.0).rg;
+  let th = t2.r * 3.0;
+  let speed = t2.g / max(t2.r, 1e-4);
+
+  // Refract the background through the surface (y flipped: texture space
+  // is top-down while view space is up).
+  let off = vec2f(n.x, -n.y) * clamp(th, 0.0, 1.5) * 0.06;
+  let refr = textureSampleLevel(sceneTex, linSamp, clamp(tuv + off, vec2f(0.001), vec2f(0.999)), 0.0).rgb;
+
+  // Beer-Lambert absorption, red first (deep water goes blue-green).
+  var col = refr * exp(vec3f(-2.6, -1.0, -0.55) * th);
+  col += vec3f(0.04, 0.16, 0.24) * (1.0 - exp(-th * 2.5)); // in-scatter
+
+  let e = normalize(-P);
+  let fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, e), 0.0), 5.0);
+  col = mix(col, vec3f(0.35, 0.50, 0.60), fres * 0.8);
+  let hv = normalize(R.lightV.xyz + e);
+  col += vec3f(0.9) * pow(max(dot(n, hv), 0.0), 120.0);
+
+  let foam = smoothstep(0.45, 0.9, speed);
+  col = mix(col, vec3f(0.93, 0.97, 1.0), foam * 0.75);
+
+  // Sparse water (lone droplets, spray) fades toward the scene instead of
+  // shading as a fully opaque sphere.
+  let cov = smoothstep(0.0, 0.09, th);
+  return vec4f(mix(scene, col, cov), 1.0);
+}
+`;
+
   return {
     sim,
-    render: renderCommon + renderBG + renderPoints,
+    render: renderCommon + renderBG + renderPoints + renderSSF,
+    blur,
+    composite,
   };
 }
