@@ -328,6 +328,7 @@ struct RenderU {
 @group(0) @binding(0) var<uniform> R: RenderU;
 @group(0) @binding(1) var<storage, read> pos: array<vec4f>;
 @group(0) @binding(2) var<storage, read> vel: array<vec4f>;
+@group(0) @binding(3) var frontTex: texture_2d<f32>; // raw water depth (fsThick only)
 
 @vertex
 fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
@@ -451,6 +452,7 @@ struct PointVSOut {
   @location(0) q: vec2f,
   @location(1) @interpolate(flat) centerV: vec3f,
   @location(2) @interpolate(flat) speed: f32,
+  @location(3) @interpolate(flat) viewZ: f32,
 };
 
 fn pointCorner(vi: u32) -> vec2f {
@@ -462,7 +464,7 @@ fn pointVS(vi: u32, ii: u32, scale: f32, sizeMul: f32) -> PointVSOut {
   let pa = pos[ii];
   if (pa.w < 0.0) {
     o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
-    o.q = vec2f(0.0); o.centerV = vec3f(0.0); o.speed = 0.0;
+    o.q = vec2f(0.0); o.centerV = vec3f(0.0); o.speed = 0.0; o.viewZ = 0.0;
     return o;
   }
   let wp = pa.xyz * (2.0 / GRIDF) - vec3f(1.0);
@@ -475,6 +477,7 @@ fn pointVS(vi: u32, ii: u32, scale: f32, sizeMul: f32) -> PointVSOut {
   o.q = corner;
   o.centerV = center;
   o.speed = vel[ii].w / VMAX;
+  o.viewZ = z;
   return o;
 }
 
@@ -555,6 +558,14 @@ fn fsThick(v: PointVSOut) -> @location(0) vec4f {
   let q = v.q;
   let r2 = dot(q, q);
   if (r2 > 1.0) { discard; }
+  // Occlusion: water well behind the visible surface must not contribute
+  // thickness or foam, or the pool draws its silhouette (and dilutes foam)
+  // through the stream in front of it. Fragments outside the depth
+  // silhouette (front = 0) are kept — they feather the edges.
+  let s = vec2i(textureDimensions(frontTex));
+  let px = clamp(vec2i(v.pos.xy * 2.0), vec2i(0), s - vec2i(1));
+  let front = textureLoad(frontTex, px, 0).r;
+  if (front > 0.0 && v.viewZ > front + 0.3) { discard; }
   let f = 1.0 - r2;
   let th = f * f * PRADIUS * 2.0;
   return vec4f(th, th * v.speed, 0.0, 1.0);
@@ -629,8 +640,9 @@ fn fsBlur(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   var z0 = textureLoad(srcTex, tx, 0).r;
 
   // Gap fill (morphological closing): fill a no-water pixel only when water
-  // lies on BOTH sides along this axis at a compatible depth, so droplets
-  // merge without inflating outer silhouettes.
+  // lies on BOTH sides along this axis, taking the NEARER depth when the
+  // sides disagree, so a near surface (the stream) stays continuous in
+  // front of a far one (the pool). One-sided support is rejected.
   if (z0 <= 0.0) {
     var zp = 0.0;
     var zm = 0.0;
@@ -640,23 +652,38 @@ fn fsBlur(@builtin(position) frag: vec4f) -> @location(0) vec4f {
       if (zp <= 0.0) { zp = dfetch(tx + dir * i); ip = i; }
       if (zm <= 0.0) { zm = dfetch(tx - dir * i); im = i; }
     }
-    if (zp <= 0.0 || zm <= 0.0 || abs(zp - zm) > NRANGE) { return vec4f(0.0); }
+    if (zp <= 0.0 || zm <= 0.0) { return vec4f(0.0); }
     z0 = min(zp, zm);
     let reach = clamp(0.045 * BU.scalePx / z0, 2.0, 20.0);
     if (f32(ip + im) > reach) { return vec4f(0.0); }
   }
 
+  // Narrow-range filter with lower-bound clamping (Truong & Yuksel, i3D
+  // 2018): clamp samples toward the nearest depth in the window instead of
+  // rejecting them, so the near surface wins where surfaces overlap.
   let radius = clamp(0.045 * BU.scalePx / z0, 2.0, 20.0);
-  var sum = z0;
-  var wsum = 1.0;
+  var sa: array<f32, 20>;
+  var sb: array<f32, 20>;
+  var n = 0;
+  var zmin = z0;
   for (var i = 1; i <= 20; i++) {
-    let fi = f32(i);
-    if (fi > radius) { break; }
-    let g = exp(-fi * fi / (0.5 * radius * radius));
+    if (f32(i) > radius) { break; }
     let za = dfetch(tx + dir * i);
     let zb = dfetch(tx - dir * i);
-    if (za > 0.0 && abs(za - z0) < NRANGE) { sum += za * g; wsum += g; }
-    if (zb > 0.0 && abs(zb - z0) < NRANGE) { sum += zb * g; wsum += g; }
+    sa[i - 1] = za;
+    sb[i - 1] = zb;
+    n = i;
+    if (za > 0.0) { zmin = min(zmin, za); }
+    if (zb > 0.0) { zmin = min(zmin, zb); }
+  }
+  let hi = zmin + NRANGE;
+  var sum = min(z0, hi);
+  var wsum = 1.0;
+  for (var i = 1; i <= n; i++) {
+    let fi = f32(i);
+    let g = exp(-fi * fi / (0.5 * radius * radius));
+    if (sa[i - 1] > 0.0) { sum += min(sa[i - 1], hi) * g; wsum += g; }
+    if (sb[i - 1] > 0.0) { sum += min(sb[i - 1], hi) * g; wsum += g; }
   }
   return vec4f(sum / wsum, 0.0, 0.0, 1.0);
 }
