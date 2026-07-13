@@ -334,7 +334,11 @@ canvas.addEventListener('wheel', (e) => {
 }, { passive: false });
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
-  if (e.code === 'KeyF') renderMode = renderMode === 'ssf' ? 'points' : 'ssf';
+  if (e.code === 'KeyF') {
+    renderMode = renderMode === 'ssf' ? 'points' : 'ssf';
+    syncURL();
+    syncPanel();
+  }
 });
 
 let renderMode = params.get('r') === 'points' ? 'points' : 'ssf';
@@ -350,8 +354,19 @@ function syncPanel() {
   for (const b of panel.querySelectorAll('button[data-p]')) {
     b.classList.toggle('on', parseInt(b.dataset.p, 10) === PTEX);
   }
+  for (const b of panel.querySelectorAll('button[data-r]')) {
+    b.classList.toggle('on', b.dataset.r === renderMode);
+  }
 }
 syncPanel();
+
+function syncURL() {
+  const q = new URLSearchParams(location.search);
+  q.set('g', GRID);
+  q.set('p', PTEX);
+  q.set('r', renderMode);
+  history.replaceState(null, '', '?' + q.toString());
+}
 
 panel.addEventListener('click', (e) => {
   const b = e.target.closest('button');
@@ -365,13 +380,16 @@ panel.addEventListener('click', (e) => {
     const p = parseInt(b.dataset.p, 10);
     if (p === PTEX) return;
     PTEX = p;
+  } else if (b.dataset.r) {
+    // Renderer switch: no sim restart, just a different render path.
+    renderMode = b.dataset.r;
+    syncURL();
+    syncPanel();
+    return;
   } else {
     return;
   }
-  const q = new URLSearchParams(location.search);
-  q.set('g', GRID);
-  q.set('p', PTEX);
-  history.replaceState(null, '', '?' + q.toString());
+  syncURL();
   backend.init(config());
   syncPanel();
 });
