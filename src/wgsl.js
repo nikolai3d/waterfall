@@ -8,7 +8,7 @@
 import { ROCKS } from './shaders.js';
 
 export function makeWGSL(opts) {
-  const { GRID, LIFE, N, ISO } = opts; // ISO validated/defaulted in app.js
+  const { GRID, LIFE, N, ISO, K } = opts; // ISO/K validated/defaulted in app.js
   const s = GRID / 64;
   const vec3f = (a) => `vec3f(${a.map((v) => v.toFixed(2)).join(', ')})`;
   const NROCK = ROCKS.length;
@@ -630,6 +630,134 @@ fn fsGizmo(v: GizmoOut) -> @location(0) vec4f {
 }
 `;
 
+  // --- Anisotropic ellipsoid splatting (r=aniso) ----------------------------
+  // Same SSF pipeline, but the depth/thickness splats are velocity-oriented
+  // ellipsoids (after Yu & Turk 2013, cheap per-particle variant): major axis
+  // along the view-space velocity, elongation 1 + K*min(speed/VMAX, 1)
+  // (damped for freshly spawned particles), minor axes shrunk 1/sqrt(elong)
+  // to conserve volume. The fragment intersects a unit sphere in the
+  // ellipsoid's normalized space; the ray is approximated as view-space -z
+  // within the splat (the same orthographic-silhouette approximation the
+  // spherical impostors already make).
+  const renderAniso = `
+const ANISO_K: f32 = ${K.toFixed(4)};   // ?k= elongation gain
+const ANISO_AGE: f32 = 24.0;            // substeps to ramp in elongation
+const THICK_MUL: f32 = 1.7;             // thickness footprint (matches vsThick)
+
+struct AnisoVSOut {
+  @builtin(position) pos: vec4f,
+  @location(0) q: vec2f,
+  @location(1) @interpolate(flat) centerV: vec3f,
+  // Rows of the inverse semi-axis matrix, pre-multiplied so that
+  // n = q.x*qx + q.y*qy + zoff*qz is the ellipsoid-normalized coordinate.
+  @location(2) @interpolate(flat) qx: vec3f,
+  @location(3) @interpolate(flat) qy: vec3f,
+  @location(4) @interpolate(flat) qz: vec3f,
+  @location(5) @interpolate(flat) hs: f32,
+  @location(6) @interpolate(flat) speed: f32,
+  @location(7) @interpolate(flat) viewZ: f32,
+};
+
+fn anisoVS(vi: u32, ii: u32, scale: f32, sizeMul: f32) -> AnisoVSOut {
+  var o: AnisoVSOut;
+  let pa = pos[ii];
+  if (pa.w < 0.0) {
+    o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
+    o.q = vec2f(0.0); o.centerV = vec3f(0.0);
+    o.qx = vec3f(0.0); o.qy = vec3f(0.0); o.qz = vec3f(0.0);
+    o.hs = 0.0; o.speed = 0.0; o.viewZ = 0.0;
+    return o;
+  }
+  let wp = pa.xyz * (2.0 / GRIDF) - vec3f(1.0);
+  let center = (R.view * vec4f(wp, 1.0)).xyz;
+  let z = max(-center.z, 0.05);
+
+  // Ellipsoid basis in view space: major axis along the velocity.
+  let vl = vel[ii];
+  var elong = 1.0 + ANISO_K * min(vl.w / VMAX, 1.0) * clamp(pa.w / ANISO_AGE, 0.0, 1.0);
+  var axis = vec3f(0.0, 0.0, 1.0);
+  if (vl.w > 1e-4) {
+    axis = normalize((R.view * vec4f(vl.xyz / vl.w, 0.0)).xyz);
+  } else {
+    elong = 1.0; // near-rest particle: plain sphere
+  }
+  var refv = vec3f(0.0, 1.0, 0.0);
+  if (abs(axis.y) > 0.9) { refv = vec3f(1.0, 0.0, 0.0); }
+  let m1 = normalize(cross(axis, refv));
+  let m2 = cross(axis, m1);
+  let ra = PRADIUS * elong * sizeMul;              // major semi-axis
+  let rb = PRADIUS * inverseSqrt(elong) * sizeMul; // minors conserve volume
+
+  // Conservative quad: exact orthographic extents of the projected ellipse
+  // per screen axis (row norms of the semi-axis matrix), square because the
+  // WebGL2 backend's point sprites are square (keeps backends identical).
+  let ex = sqrt(ra * ra * axis.x * axis.x + rb * rb * (m1.x * m1.x + m2.x * m2.x));
+  let ey = sqrt(ra * ra * axis.y * axis.y + rb * rb * (m1.y * m1.y + m2.y * m2.y));
+  let sizePx = clamp(scale * max(ex, ey) / z, 1.0, 96.0);
+  let hs = sizePx * z / scale; // view-space half extent matching the px size
+
+  let corner = pointCorner(vi);
+  o.pos = R.proj * vec4f(center + vec3f(corner * hs, 0.0), 1.0);
+  o.q = corner;
+  o.centerV = center;
+  o.qx = hs * vec3f(axis.x / ra, m1.x / rb, m2.x / rb);
+  o.qy = hs * vec3f(axis.y / ra, m1.y / rb, m2.y / rb);
+  o.qz = vec3f(axis.z / ra, m1.z / rb, m2.z / rb);
+  o.hs = hs;
+  o.speed = vl.w / VMAX;
+  o.viewZ = z;
+  return o;
+}
+
+@vertex
+fn vsPointsAniso(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> AnisoVSOut {
+  return anisoVS(vi, ii, R.misc.x, 1.0);
+}
+
+@vertex
+fn vsThickAniso(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> AnisoVSOut {
+  return anisoVS(vi, ii, R.misc.y, THICK_MUL);
+}
+
+// Depth pass: intersect the view ray (approximated as -z through the
+// fragment) with the ellipsoid — a unit sphere in normalized space.
+@fragment
+fn fsPointDepthAniso(v: AnisoVSOut) -> DepthOut {
+  let q0 = v.q.x * v.qx + v.q.y * v.qy;
+  let a2 = dot(v.qz, v.qz);
+  let b = 2.0 * dot(q0, v.qz);
+  let c = dot(q0, q0) - 1.0;
+  let disc = b * b - 4.0 * a2 * c;
+  if (disc < 0.0) { discard; }
+  let zoff = (-b + sqrt(disc)) / (2.0 * a2); // front surface (larger view z)
+  let fp = v.centerV + vec3f(v.q * v.hs, zoff);
+  let clip = R.proj * vec4f(fp, 1.0);
+  var o: DepthOut;
+  o.depth = clamp(clip.z / clip.w, 0.0, 1.0);
+  o.col = vec4f(-fp.z, 0.0, 0.0, 1.0);
+  return o;
+}
+
+// Thickness pass: falloff from the elliptical silhouette; amplitude is the
+// view-z chord scale 2/|qz| (reduces to the spherical 2*PRADIUS at k=0).
+@fragment
+fn fsThickAniso(v: AnisoVSOut) -> @location(0) vec4f {
+  let q0 = v.q.x * v.qx + v.q.y * v.qy;
+  let a2 = dot(v.qz, v.qz);
+  let dz = dot(q0, v.qz);
+  let f = 1.0 - (dot(q0, q0) - dz * dz / a2); // 1 - silhouette r^2
+  if (f <= 0.0) { discard; }
+  // Occlusion vs the raw water depth, same rule as fsThick.
+  let s = vec2i(textureDimensions(frontTex));
+  let px = clamp(vec2i(v.pos.xy * 2.0), vec2i(0), s - vec2i(1));
+  let front = textureLoad(frontTex, px, 0).r;
+  var keep = 1.0;
+  if (front > 0.0 && v.viewZ > front + 0.3) { keep = 0.0; }
+  let th = f * f * 2.0 / (sqrt(a2) * THICK_MUL);
+  return vec4f(th * keep, th * v.speed * keep, th, 1.0);
+}
+`;
+
   // Separable depth-aware blur with the gap-fill closing (own module: it
   // has its own binding namespace).
   const blur = `
@@ -1183,7 +1311,7 @@ fn fsUpscale(v: UpVSOut) -> @location(0) vec4f {
 
   return {
     sim,
-    render: renderCommon + sceneShade + renderBG + renderPoints + renderSSF,
+    render: renderCommon + sceneShade + renderBG + renderPoints + renderSSF + renderAniso,
     blur,
     composite,
     volBlur,

@@ -17,7 +17,7 @@ export function gridLayout(GRID) {
 }
 
 export function makeShaders(opts) {
-  const { GRID, PTEX, LIFE, ISO } = opts; // ISO validated/defaulted in app.js
+  const { GRID, PTEX, LIFE, ISO, K } = opts; // ISO/K validated/defaulted in app.js
   const { TILES, GTEX } = gridLayout(GRID);
   const s = GRID / 64;
   const vec3 = (a) => `vec3(${a.map((v) => v.toFixed(2)).join(', ')})`;
@@ -448,6 +448,136 @@ void main() {
   float keep = (front > 0.0 && vZ > front + 0.3) ? 0.0 : 1.0;
   float f = 1.0 - r2;
   float th = f * f * PRADIUS * 2.0;
+  o = vec4(th * keep, th * vSpeed * keep, th, 1.0);
+}
+`;
+
+  // --- Anisotropic ellipsoid splatting (r=aniso) ------------------------
+  // Same SSF pipeline, but the depth/thickness splats are velocity-oriented
+  // ellipsoids (after Yu & Turk 2013, cheap per-particle variant): major
+  // axis along the view-space velocity, elongation 1 + K*min(speed/VMAX, 1)
+  // (damped for freshly spawned particles), minor axes shrunk 1/sqrt(elong)
+  // to conserve volume. The fragment intersects a unit sphere in the
+  // ellipsoid's normalized space; the ray is approximated as view-space -z
+  // within the splat (the same orthographic-silhouette approximation the
+  // spherical impostors already make). Point sprites are square, so the
+  // sprite size is the max of the projected ellipse's per-axis extents.
+  const anisoConsts = `
+const float ANISO_K = ${K.toFixed(4)};   // ?k= elongation gain
+const float ANISO_AGE = 24.0;            // substeps to ramp in elongation
+const float THICK_MUL = 1.7;             // thickness footprint (matches vsThick)
+`;
+
+  const vsPointAniso = header + anisoConsts + `
+uniform sampler2D uPos, uVel;
+uniform mat4 uProj, uView;
+uniform float uPointScale;
+uniform float uSizeMul; // 1.0 for the depth pass, THICK_MUL for thickness
+flat out vec3 vCenterV;
+// Rows of the inverse semi-axis matrix, pre-multiplied so that
+// n = q.x*vQx + q.y*vQy + zoff*vQz is the ellipsoid-normalized coordinate.
+flat out vec3 vQx, vQy, vQz;
+flat out float vHs;
+flat out float vSpeed;
+flat out float vZ;
+
+void main() {
+  ivec2 pt = ivec2(gl_VertexID % PTEX, gl_VertexID / PTEX);
+  vec4 pa = texelFetch(uPos, pt, 0);
+  if (pa.w < 0.0) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0;
+    vCenterV = vec3(0.0); vQx = vec3(0.0); vQy = vec3(0.0); vQz = vec3(0.0);
+    vHs = 0.0; vSpeed = 0.0; vZ = 0.0;
+    return;
+  }
+  vec4 vl = texelFetch(uVel, pt, 0);
+  vec3 wp = pa.xyz * (2.0 / GRIDF) - 1.0;
+  vec4 vp = uView * vec4(wp, 1.0);
+  float z = max(-vp.z, 0.05);
+
+  // Ellipsoid basis in view space: major axis along the velocity.
+  float elong = 1.0 + ANISO_K * min(vl.w / VMAX, 1.0) * clamp(pa.w / ANISO_AGE, 0.0, 1.0);
+  vec3 axis = vec3(0.0, 0.0, 1.0);
+  if (vl.w > 1e-4) axis = normalize((uView * vec4(vl.xyz / vl.w, 0.0)).xyz);
+  else elong = 1.0; // near-rest particle: plain sphere
+  vec3 refv = abs(axis.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+  vec3 m1 = normalize(cross(axis, refv));
+  vec3 m2 = cross(axis, m1);
+  float ra = PRADIUS * elong * uSizeMul;              // major semi-axis
+  float rb = PRADIUS * inversesqrt(elong) * uSizeMul; // minors conserve volume
+
+  // Conservative sprite: exact orthographic extents of the projected
+  // ellipse per screen axis (row norms of the semi-axis matrix).
+  float ex = sqrt(ra * ra * axis.x * axis.x + rb * rb * (m1.x * m1.x + m2.x * m2.x));
+  float ey = sqrt(ra * ra * axis.y * axis.y + rb * rb * (m1.y * m1.y + m2.y * m2.y));
+  float sizePx = clamp(uPointScale * max(ex, ey) / z, 1.0, 96.0);
+  float hs = sizePx * z / uPointScale; // view-space half extent of the sprite
+
+  gl_Position = uProj * vp;
+  gl_PointSize = sizePx;
+  vCenterV = vp.xyz;
+  vQx = hs * vec3(axis.x / ra, m1.x / rb, m2.x / rb);
+  vQy = hs * vec3(axis.y / ra, m1.y / rb, m2.y / rb);
+  vQz = vec3(axis.z / ra, m1.z / rb, m2.z / rb);
+  vHs = hs;
+  vSpeed = vl.w / VMAX;
+  vZ = z;
+}
+`;
+
+  // Depth pass: intersect the view ray (approximated as -z through the
+  // fragment) with the ellipsoid — a unit sphere in normalized space.
+  const fsPointDepthAniso = header + `
+uniform mat4 uProj;
+flat in vec3 vCenterV;
+flat in vec3 vQx, vQy, vQz;
+flat in float vHs;
+flat in float vSpeed;
+flat in float vZ;
+out vec4 o;
+
+void main() {
+  vec2 q = gl_PointCoord * 2.0 - 1.0;
+  q.y = -q.y;
+  vec3 q0 = q.x * vQx + q.y * vQy;
+  float a2 = dot(vQz, vQz);
+  float b = 2.0 * dot(q0, vQz);
+  float c = dot(q0, q0) - 1.0;
+  float disc = b * b - 4.0 * a2 * c;
+  if (disc < 0.0) discard;
+  float zoff = (-b + sqrt(disc)) / (2.0 * a2); // front surface (larger view z)
+  vec3 fp = vCenterV + vec3(q * vHs, zoff);
+  vec4 clip = uProj * vec4(fp, 1.0);
+  gl_FragDepth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
+  o = vec4(-fp.z, 0.0, 0.0, 1.0);
+}
+`;
+
+  // Thickness pass: falloff from the elliptical silhouette; amplitude is the
+  // view-z chord scale 2/|qz| (reduces to the spherical 2*PRADIUS at k=0).
+  const fsThickAniso = header + anisoConsts + `
+uniform sampler2D uFront; // raw water depth, full resolution
+flat in vec3 vCenterV;
+flat in vec3 vQx, vQy, vQz;
+flat in float vHs;
+flat in float vSpeed;
+flat in float vZ;
+out vec4 o;
+
+void main() {
+  vec2 q = gl_PointCoord * 2.0 - 1.0;
+  q.y = -q.y;
+  vec3 q0 = q.x * vQx + q.y * vQy;
+  float a2 = dot(vQz, vQz);
+  float dz = dot(q0, vQz);
+  float f = 1.0 - (dot(q0, q0) - dz * dz / a2); // 1 - silhouette r^2
+  if (f <= 0.0) discard;
+  // Occlusion vs the raw water depth, same rule as fsThick.
+  ivec2 s = textureSize(uFront, 0);
+  ivec2 px = clamp(ivec2(gl_FragCoord.xy * 2.0), ivec2(0), s - 1);
+  float front = texelFetch(uFront, px, 0).r;
+  float keep = (front > 0.0 && vZ > front + 0.3) ? 0.0 : 1.0;
+  float th = f * f * 2.0 / (sqrt(a2) * THICK_MUL);
   o = vec4(th * keep, th * vSpeed * keep, th, 1.0);
 }
 `;
@@ -1107,6 +1237,7 @@ void main() {
     vsQuad, vsP2G1, vsP2G2, fsScatter, fsDensity, fsGrid, fsG2P,
     vsPoint, fsPoint, fsBackground,
     fsPointDepth, vsThick, fsThick, fsBlur, fsComposite, fsBlit,
+    vsPointAniso, fsPointDepthAniso, fsThickAniso,
     fsVolBlur, fsVolume, fsVoxel, fsVolUpscale,
     vsGizmo, fsGizmo,
   };

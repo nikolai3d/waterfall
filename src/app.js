@@ -27,6 +27,12 @@ if (!(RSCALE >= 0.1 && RSCALE <= 1)) RSCALE = 0.5;
 let ISO = parseFloat(params.get('iso') || '1.5');
 if (!(ISO >= 0.1 && ISO <= 16)) ISO = 1.5;
 
+// Aniso renderer elongation gain (?k=): splats stretch along velocity by
+// 1 + k*min(speed/VMAX, 1). Clamped to 0..4 so fast splash particles don't
+// streak; garbage or out-of-range values fall back to the default.
+let K = parseFloat(params.get('k') || '1.5');
+if (!(K >= 0 && K <= 4)) K = 1.5;
+
 // The CFL clamp caps velocity in cells/substep, so finer grids need more
 // substeps per frame to move at the same world-space speed.
 const defaultSubsteps = () => Math.max(1, Math.round(GRID / 32));
@@ -130,7 +136,7 @@ function initialParticleData() {
 function config() {
   N = PTEX * PTEX;
   updateRockData();
-  return { GRID, PTEX, LIFE, N, RSCALE, ISO, initialData: initialParticleData(), rockData, rockVel };
+  return { GRID, PTEX, LIFE, N, RSCALE, ISO, K, initialData: initialParticleData(), rockData, rockVel };
 }
 
 backend.init(config());
@@ -354,7 +360,7 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-let renderMode = ['points', 'ssf', 'volume', 'voxel'].includes(params.get('r')) ? params.get('r') : 'ssf';
+let renderMode = ['points', 'ssf', 'volume', 'voxel', 'aniso'].includes(params.get('r')) ? params.get('r') : 'ssf';
 
 // Resolution panel: changing a value rebuilds the whole sim in place
 // (camera and pause state survive); the URL stays shareable.
@@ -505,7 +511,8 @@ function tick(now) {
     statsEl.textContent =
       `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${renderMode}` +
       (renderMode === 'volume' || renderMode === 'voxel' ? ` rscale=${RSCALE}` : '') +
-      (renderMode === 'voxel' ? ` iso=${ISO}` : '') + ` · ${backend.name}` +
+      (renderMode === 'voxel' ? ` iso=${ISO}` : '') +
+      (renderMode === 'aniso' ? ` k=${K}` : '') + ` · ${backend.name}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;

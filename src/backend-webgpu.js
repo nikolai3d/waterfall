@@ -160,7 +160,7 @@ export async function createBackend({ canvas, fail }) {
     cfg = config;
     NCELL = cfg.GRID ** 3;
 
-    const S = makeWGSL({ GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N, ISO: cfg.ISO });
+    const S = makeWGSL({ GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N, ISO: cfg.ISO, K: cfg.K });
     const simModule = device.createShaderModule({ code: S.sim });
     const renderModule = device.createShaderModule({ code: S.render });
     const blurModule = device.createShaderModule({ code: S.blur });
@@ -230,6 +230,20 @@ export async function createBackend({ canvas, fail }) {
         layout: thickPipeLayout,
         vertex: { module: renderModule, entryPoint: 'vsThick' },
         fragment: { module: renderModule, entryPoint: 'fsThick', targets: [{ format: 'rgba16float', blend: addBlend }] },
+        primitive: { topology: 'triangle-strip' },
+      }),
+      // Aniso (r=aniso) variants of the depth/thickness splats; the rest of
+      // the SSF pipeline (blur, composite, occlusion) is shared unchanged.
+      pointDepthAniso: rp({
+        vertex: { module: renderModule, entryPoint: 'vsPointsAniso' },
+        fragment: { module: renderModule, entryPoint: 'fsPointDepthAniso', targets: [{ format: 'r32float' }] },
+        primitive: { topology: 'triangle-strip' },
+        depthStencil: depthState,
+      }),
+      thickAniso: device.createRenderPipeline({
+        layout: thickPipeLayout,
+        vertex: { module: renderModule, entryPoint: 'vsThickAniso' },
+        fragment: { module: renderModule, entryPoint: 'fsThickAniso', targets: [{ format: 'rgba16float', blend: addBlend }] },
         primitive: { topology: 'triangle-strip' },
       }),
       gizmoDepth: rp({
@@ -499,6 +513,11 @@ export async function createBackend({ canvas, fail }) {
       return;
     }
 
+    // Screen-space fluid path ('ssf' and 'aniso' — aniso swaps the depth and
+    // thickness splat pipelines for ellipsoid variants, everything else is
+    // identical).
+    const aniso = frame.mode === 'aniso';
+
     // 1. scene (cube walls + rocks) into offscreen color + depth
     let pass = enc.beginRenderPass({
       colorAttachments: [{ view: RT.v.sceneColor, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
@@ -519,7 +538,7 @@ export async function createBackend({ canvas, fail }) {
       },
     });
     pass.setBindGroup(0, renderBGGroup);
-    pass.setPipeline(pipes.pointDepth);
+    pass.setPipeline(aniso ? pipes.pointDepthAniso : pipes.pointDepth);
     pass.draw(4, cfg.N);
     pass.end();
 
@@ -545,7 +564,7 @@ export async function createBackend({ canvas, fail }) {
       colorAttachments: [{ view: RT.v.thick, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }],
     });
     pass.setBindGroup(0, thickBGGroup);
-    pass.setPipeline(pipes.thick);
+    pass.setPipeline(aniso ? pipes.thickAniso : pipes.thick);
     pass.draw(4, cfg.N);
     pass.end();
 
