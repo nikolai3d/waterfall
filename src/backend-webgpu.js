@@ -140,14 +140,18 @@ export async function createBackend({ canvas, fail }) {
   const mcPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [mcLayout] });
   const meshPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [meshLayout] });
 
-  // MC resources are config-independent: the triangle table is constant, the
-  // vertex pool is capped (pos + normal vec4f pairs, 32 B/vertex), and the
-  // 16-byte indirect args buffer doubles as the emit kernel's atomic vertex
-  // counter (reset per frame, clamped to the cap by mcFinalize).
-  const bufMCTri = buf(MC_TRI.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, MC_TRI);
-  const bufMCVerts = device.createBuffer({ size: MC_CAP * 32, usage: GPUBufferUsage.STORAGE });
-  const bufMCArgs = buf(16, GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST);
-  const mcArgsReset = new Uint32Array([0, 1, 0, 0]); // vertexCount, instances, firsts
+  // MC buffers are config-independent but big (the vertex pool alone is
+  // 48 MB), so they are created lazily by ensureMeshResources() on the first
+  // mesh-mode frame instead of taxing the other renderers here: the triangle
+  // table is constant, the vertex pool is capped (pos + normal vec4f pairs,
+  // 32 B/vertex), and the indirect args buffer doubles as the emit kernel's
+  // atomic vertex counter (reset per frame, clamped to the cap by
+  // mcFinalize). Args word 4 sits past the 16-byte drawIndirect args and
+  // carries the overflow flag mcFinalize raises.
+  let bufMCTri = null;
+  let bufMCVerts = null;
+  let bufMCArgs = null;
+  const mcArgsReset = new Uint32Array([0, 1, 0, 0, 0]); // vtxCount, instances, firsts, overflow
 
   const alphaBlend = {
     color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -357,26 +361,42 @@ export async function createBackend({ canvas, fail }) {
         { binding: 1, resource: { buffer: bufVolDens } },
       ],
     });
-    mcBG = device.createBindGroup({
-      layout: mcLayout,
-      entries: [
-        { binding: 0, resource: { buffer: bufVolDens } },
-        { binding: 1, resource: { buffer: bufMCTri } },
-        { binding: 2, resource: { buffer: bufMCVerts } },
-        { binding: 3, resource: { buffer: bufMCArgs } },
-      ],
-    });
-    meshBG = device.createBindGroup({
-      layout: meshLayout,
-      entries: [
-        { binding: 0, resource: { buffer: bufRenderU } },
-        { binding: 1, resource: { buffer: bufMCVerts } },
-        { binding: 2, resource: { buffer: bufVolDens } },
-      ],
-    });
+    // Mesh bind groups reference the per-config density buffer, so a rebuild
+    // invalidates them; ensureMeshResources() recreates them on the next
+    // mesh-mode frame (and the capped pool buffers on the first one ever).
+    mcBG = null;
+    meshBG = null;
 
     makeRenderBG();
     substepCount = 0;
+  }
+
+  function ensureMeshResources() {
+    if (!bufMCVerts) {
+      bufMCTri = buf(MC_TRI.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, MC_TRI);
+      bufMCVerts = device.createBuffer({ size: MC_CAP * 32, usage: GPUBufferUsage.STORAGE });
+      bufMCArgs = buf(mcArgsReset.byteLength,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST);
+    }
+    if (!mcBG) {
+      mcBG = device.createBindGroup({
+        layout: mcLayout,
+        entries: [
+          { binding: 0, resource: { buffer: bufVolDens } },
+          { binding: 1, resource: { buffer: bufMCTri } },
+          { binding: 2, resource: { buffer: bufMCVerts } },
+          { binding: 3, resource: { buffer: bufMCArgs } },
+        ],
+      });
+      meshBG = device.createBindGroup({
+        layout: meshLayout,
+        entries: [
+          { binding: 0, resource: { buffer: bufRenderU } },
+          { binding: 1, resource: { buffer: bufMCVerts } },
+          { binding: 2, resource: { buffer: bufVolDens } },
+        ],
+      });
+    }
   }
 
   // The thick group depends on per-config buffers AND the per-size raw
@@ -566,6 +586,7 @@ export async function createBackend({ canvas, fail }) {
       // density, emit a triangle mesh (atomic slot reservation into a capped
       // vertex pool + indirect args), then draw it depth-tested in the same
       // pass as the raytraced background — real occlusion both ways.
+      ensureMeshResources();
       device.queue.writeBuffer(bufMCArgs, 0, mcArgsReset);
       const cpass = enc.beginComputePass();
       cpass.setPipeline(pipes.volBlur);
@@ -712,5 +733,9 @@ export async function createBackend({ canvas, fail }) {
     device.destroy();
   }
 
-  return { name: 'webgpu', init, substep, render, readParticles, dispose };
+  // effectiveMode: this backend implements every render mode as selected.
+  return {
+    name: 'webgpu', init, substep, render, readParticles, dispose,
+    effectiveMode: (mode) => mode,
+  };
 }

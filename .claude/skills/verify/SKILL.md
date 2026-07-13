@@ -37,6 +37,15 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
 - `?r=mesh` is the marching-cubes isosurface mesh — WebGPU only: on WebGL2
   the chip stays enabled but the mode renders the `ssf` path (console note,
   no error overlay), so a `?api=webgl2&r=mesh` shot must look like `r=ssf`.
+- Evidence for WebGPU-only modes (`r=mesh`) must pin `?api=webgpu` AND
+  stats-assert BOTH the mode token and the backend name. Two markers make a
+  silent fallback impossible to mistake for the real thing: when the auto
+  backend selection falls back (webgpu import failed, `api` not pinned) the
+  backend token reads `webgl2 (fallback)`, and when a backend renders a
+  substitute for the selected mode the mode token reads `selected→effective`
+  (e.g. `mesh→ssf` on WebGL2, with the inert `iso=` readout suppressed). A
+  plain `mesh · webgl2` can therefore never appear — if your stats say
+  `mesh · webgpu`, the mesh path really ran.
 - `?r=aniso` exercises the anisotropic-ellipsoid variant of the SSF splats
   (same blur/thickness/composite pipeline); its elongation gain is `?k=`
   (default 1.5, valid 0–4; garbage or out-of-range falls back to the

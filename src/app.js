@@ -83,16 +83,21 @@ async function loadBackend(which) {
 }
 
 let backend;
+let backendFellBack = false; // auto-selection fell back: flagged in the stats line
 try {
   backend = await loadBackend(api);
 } catch (e) {
   if (api === 'webgpu' && params.get('api') !== 'webgpu') {
     console.warn('WebGPU backend unavailable, falling back to WebGL2:', e);
     backend = await loadBackend('webgl2');
+    backendFellBack = true;
   } else {
     throw e;
   }
 }
+// Persistent stats-line backend token, so a silent fallback can't masquerade
+// as the requested backend in screenshots/harness assertions.
+const backendLabel = backend.name + (backendFellBack ? ' (fallback)' : '');
 
 // ---------------------------------------------------------------------------
 // Initial particle layout: a shallow pool plus staggered spout spawns.
@@ -471,7 +476,7 @@ function benchTick() {
     const ms = (performance.now() - benchStart) / BENCH;
     benchDone = true;
     paused = true;
-    const line = `bench ${backend.name} g=${GRID} p=${PTEX} s=${SUBSTEPS}: ` +
+    const line = `bench ${backendLabel} g=${GRID} p=${PTEX} s=${SUBSTEPS}: ` +
       `${ms.toFixed(2)} ms/frame · ${(1000 / ms).toFixed(1)} fps`;
     statsEl.textContent = line;
     document.title = line;
@@ -508,11 +513,17 @@ function tick(now) {
   if (DEBUG && frames % 5 === 0) debugDump();
   if (!benchDone && now - lastFps > 500) {
     const fps = (frames * 1000) / (now - lastFps);
+    // Effective-mode honesty: when the backend doesn't implement the
+    // selected mode (WebGL2 + mesh renders the ssf path), the mode token
+    // reads `mesh→ssf` and the param readouts follow the EFFECTIVE mode
+    // (so e.g. iso=, which does nothing there, is suppressed).
+    const eff = backend.effectiveMode ? backend.effectiveMode(renderMode) : renderMode;
+    const modeToken = eff === renderMode ? renderMode : `${renderMode}→${eff}`;
     statsEl.textContent =
-      `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${renderMode}` +
-      (renderMode === 'volume' || renderMode === 'voxel' ? ` rscale=${RSCALE}` : '') +
-      (renderMode === 'voxel' || renderMode === 'mesh' ? ` iso=${ISO}` : '') +
-      (renderMode === 'aniso' ? ` k=${K}` : '') + ` · ${backend.name}` +
+      `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${modeToken}` +
+      (eff === 'volume' || eff === 'voxel' ? ` rscale=${RSCALE}` : '') +
+      (eff === 'voxel' || eff === 'mesh' ? ` iso=${ISO}` : '') +
+      (eff === 'aniso' ? ` k=${K}` : '') + ` · ${backendLabel}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;

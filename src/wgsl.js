@@ -6,7 +6,7 @@
 // updated in place. All constants are baked per config like the GLSL header.
 
 import { ROCKS, THICK_MUL, ANISO_AGE } from './shaders.js';
-import { MC_ROW, MC_CAP } from './mctables.js';
+import { MC_ROW, MC_CAP, MC_CORNERS, MC_EDGES } from './mctables.js';
 
 export function makeWGSL(opts) {
   const { GRID, LIFE, N, ISO, K } = opts; // ISO/K validated/defaulted in app.js
@@ -36,6 +36,7 @@ const EMIT_V: vec3f = vec3f(0.10, -0.05, 0.0);             // initial jet veloci
 const PRADIUS: f32 = 0.021; // particle render radius, world units
 const NROCK: i32 = ${NROCK};
 const FX: f32 = 65536.0;    // fixed-point scale for grid atomics
+const B: f32 = ${(1 - 4 / GRID).toFixed(6)}; // wall extent, world units (cells 2..GRIDI-2)
 
 fn cellIndex(g: vec3i) -> u32 {
   return u32((g.z * GRIDI + g.y) * GRIDI + g.x);
@@ -270,7 +271,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
   var W = quadWeights(fx);
 
   var v = vec3f(0.0);
-  var B = mat3x3f(vec3f(0.0), vec3f(0.0), vec3f(0.0));
+  var Bm = mat3x3f(vec3f(0.0), vec3f(0.0), vec3f(0.0));
   for (var k = 0; k < 3; k++) {
     for (var j = 0; j < 3; j++) {
       for (var ii = 0; ii < 3; ii++) {
@@ -278,11 +279,11 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
         let dpos = vec3f(f32(ii), f32(j), f32(k)) - fx;
         let gv = gridV[cellIndex(base + vec3i(ii, j, k))].xyz;
         v += w * gv;
-        B += mat3x3f(w * gv * dpos.x, w * gv * dpos.y, w * gv * dpos.z);
+        Bm += mat3x3f(w * gv * dpos.x, w * gv * dpos.y, w * gv * dpos.z);
       }
     }
   }
-  let C = B * 4.0;
+  let C = Bm * 4.0;
 
   p += v; // dt = 1
 
@@ -344,8 +345,6 @@ fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   // language (see shaders.js for GLSL). Intersection logic stays with each
   // shader.
   const sceneShade = `
-const B: f32 = ${(1 - 4 / GRID).toFixed(6)}; // wall extent (cells 2..GRIDI-2)
-
 // Rock: noise in rock-local coordinates (offset per rock), so the texture
 // is attached to the rock and moves with it when dragged, instead of the
 // rock sliding through a fixed world-space noise volume.
@@ -1300,17 +1299,16 @@ fn fsVoxel(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   // Emit kernel: one thread per cell computes the MC case from the 8 corners
   // of the blurred density (same ?iso= threshold as the voxel renderer),
   // reserves output slots with one atomicAdd on the indirect args' vertex
-  // count (the issue's sanctioned simpler variant — no prefix-sum scan;
-  // triangle order across cells is arbitrary, which is fine for an opaque
-  // surface), and writes edge-interpolated vertices with density-gradient
-  // normals into a capped vertex pool. mcArgs doubles as the drawIndirect
-  // buffer; mcFinalize clamps its vertex count to the pool cap (overflowing
-  // cells skip whole triangles past the cap, so no partial triangles).
+  // count (simpler than a prefix-sum scan; triangle order across cells is
+  // arbitrary, which is fine for an opaque surface), and writes
+  // edge-interpolated vertices with density-gradient normals into a capped
+  // vertex pool. mcArgs doubles as the drawIndirect buffer; mcFinalize
+  // clamps its vertex count to the pool cap (overflowing cells skip whole
+  // triangles past the cap, so no partial triangles).
   const mcCompute = common + `
 const MISO: f32 = ${ISO.toFixed(4)};   // iso threshold (?iso=, shared with voxel)
 const MCCAP: u32 = ${MC_CAP}u;         // vertex pool cap
 const MCROW: i32 = ${MC_ROW};          // triangle-table row stride
-const WB: f32 = ${(1 - 4 / GRID).toFixed(6)}; // wall extent, world units
 
 @group(0) @binding(0) var<storage, read> dens: array<vec2f>;  // blurred (mass, |momentum|)
 @group(0) @binding(1) var<storage, read> tri: array<i32>;     // MC triangle table
@@ -1337,27 +1335,35 @@ fn gradG(p: vec3f) -> vec3f {
     densG(p + vec3f(0.0, 0.0, h)) - densG(p - vec3f(0.0, 0.0, h)));
 }
 
+// Out-of-range lattice samples read as density 0 ("outside"), the standard
+// MC boundary trick: the isosurface caps against the walls wherever water
+// meets the domain boundary instead of leaving open backfaces.
+fn latDens(c: vec3i) -> f32 {
+  if (any(c < vec3i(0)) || any(c >= vec3i(GRIDI))) { return 0.0; }
+  return dens[cellIndex(c)].x;
+}
+
 @compute @workgroup_size(64)
 fn mcEmit(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= NCELL) { return; }
   let gi = i32(i);
   let cell = vec3i(gi % GRIDI, (gi / GRIDI) % GRIDI, gi / (GRIDI * GRIDI));
-  // Cubes span lattice [cell, cell+1]; +boundary threads have no cube.
-  if (cell.x >= GRIDI - 1 || cell.y >= GRIDI - 1 || cell.z >= GRIDI - 1) { return; }
 
-  // Corner/edge numbering must match the generator in src/mctables.js.
+  // Corner offsets / edge endpoints, interpolated from src/mctables.js
+  // (the table generator's numbering) so JS and WGSL cannot drift.
   // (var, not let/const: dynamically indexed below.)
   var CO = array<vec3i, 8>(
-    vec3i(0, 0, 0), vec3i(1, 0, 0), vec3i(1, 1, 0), vec3i(0, 1, 0),
-    vec3i(0, 0, 1), vec3i(1, 0, 1), vec3i(1, 1, 1), vec3i(0, 1, 1));
-  var EA = array<i32, 12>(0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3);
-  var EB = array<i32, 12>(1, 2, 3, 0, 5, 6, 7, 4, 4, 5, 6, 7);
+    ${MC_CORNERS.map((c) => `vec3i(${c.join(', ')})`).join(', ')});
+  var EA = array<i32, 12>(${MC_EDGES.map((e) => e[0]).join(', ')});
+  var EB = array<i32, 12>(${MC_EDGES.map((e) => e[1]).join(', ')});
 
+  // Cubes span lattice [cell, cell+1]; +boundary cubes sample out-of-range
+  // lattice points as 0 via latDens, capping the surface at the walls.
   var d: array<f32, 8>;
   var cidx = 0u;
   for (var c = 0; c < 8; c++) {
-    d[c] = dens[cellIndex(cell + CO[c])].x;
+    d[c] = latDens(cell + CO[c]);
     if (d[c] >= MISO) { cidx |= (1u << u32(c)); }
   }
   if (cidx == 0u || cidx == 255u) { return; }
@@ -1370,32 +1376,47 @@ fn mcEmit(@builtin(global_invocation_id) gid: vec3u) {
   }
   if (ntri == 0) { return; }
 
+  // Interpolate each cut edge once (position + gradient normal, the normal
+  // alone is 48 density reads) instead of per triangle-corner: a case can
+  // reference an edge up to 3 times across its <= 5 triangles.
+  var epos: array<vec3f, 12>;
+  var enrm: array<vec3f, 12>;
+  for (var e = 0; e < 12; e++) {
+    let a = EA[e];
+    let b = EB[e];
+    if (((cidx >> u32(a)) & 1u) == ((cidx >> u32(b)) & 1u)) { continue; } // not cut
+    var mu = 0.5;
+    if (abs(d[b] - d[a]) > 1e-6) { mu = clamp((MISO - d[a]) / (d[b] - d[a]), 0.0, 1.0); }
+    let pg = vec3f(cell + CO[a]) + mu * vec3f(CO[b] - CO[a]);
+    // World position, clamped to the walls so blur bleed past the
+    // boundary cells can't poke the surface through the cube.
+    epos[e] = clamp(pg * (2.0 / GRIDF) - vec3f(1.0), vec3f(-B), vec3f(B));
+    enrm[e] = normalize(-gradG(pg) + vec3f(1e-6, 0.0, 0.0)); // outward
+  }
+
   let base = atomicAdd(&mcArgs[0], u32(ntri * 3));
   for (var t = 0; t < ntri; t++) {
     if (base + u32(t * 3 + 3) > MCCAP) { break; } // pool full: drop whole tris
     for (var k = 0; k < 3; k++) {
       let e = tri[row + t * 3 + k];
-      let a = EA[e];
-      let b = EB[e];
-      var mu = 0.5;
-      if (abs(d[b] - d[a]) > 1e-6) { mu = clamp((MISO - d[a]) / (d[b] - d[a]), 0.0, 1.0); }
-      let pg = vec3f(cell + CO[a]) + mu * vec3f(CO[b] - CO[a]);
-      // World position, clamped to the walls so blur bleed past the
-      // boundary cells can't poke the surface through the cube.
-      let wp = clamp(pg * (2.0 / GRIDF) - vec3f(1.0), vec3f(-WB), vec3f(WB));
-      let nrm = normalize(-gradG(pg) + vec3f(1e-6, 0.0, 0.0)); // outward
       let slot = base + u32(t * 3 + k);
-      mverts[slot * 2u] = vec4f(wp, 1.0);
-      mverts[slot * 2u + 1u] = vec4f(nrm, 0.0);
+      mverts[slot * 2u] = vec4f(epos[e], 1.0);
+      mverts[slot * 2u + 1u] = vec4f(enrm[e], 0.0);
     }
   }
 }
 
 // Clamp the (possibly overflowed) vertex count to the pool cap; the rest of
 // the indirect args (instanceCount = 1, offsets 0) come from the JS reset.
+// On overflow, flag it in mcArgs[4] — one u32 PAST the 16-byte drawIndirect
+// args (NOT the firstInstance slot: a non-zero firstInstance makes the
+// whole indirect draw a no-op without the indirect-first-instance feature).
+// A CPU readback hook can surface the flag later; none is wired up yet, and
+// the flag is reset with the rest of the args every frame.
 @compute @workgroup_size(1)
 fn mcFinalize() {
   let n = atomicLoad(&mcArgs[0]);
+  if (n > MCCAP) { atomicStore(&mcArgs[4], 1u); }
   atomicStore(&mcArgs[0], min(n, MCCAP));
 }
 `;
