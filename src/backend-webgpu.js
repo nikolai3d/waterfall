@@ -9,6 +9,7 @@
 
 import { ROCKS } from './shaders.js';
 import { makeWGSL } from './wgsl.js';
+import { MC_TRI, MC_CAP } from './mctables.js';
 
 const NROCK = ROCKS.length;
 
@@ -111,6 +112,23 @@ export async function createBackend({ canvas, fail }) {
       { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
     ],
   });
+  // Marching-cubes mesh renderer (r=mesh): emit kernel (density + triangle
+  // table in, vertex pool + indirect args out) and the vertex-pulling draw.
+  const mcLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    ],
+  });
+  const meshLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    ],
+  });
   const simPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
   const renderPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [renderLayout] });
   const thickPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [thickLayout] });
@@ -119,6 +137,17 @@ export async function createBackend({ canvas, fail }) {
   const volBlurPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volBlurLayout] });
   const volPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volLayout] });
   const volUpPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volUpLayout] });
+  const mcPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [mcLayout] });
+  const meshPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [meshLayout] });
+
+  // MC resources are config-independent: the triangle table is constant, the
+  // vertex pool is capped (pos + normal vec4f pairs, 32 B/vertex), and the
+  // 16-byte indirect args buffer doubles as the emit kernel's atomic vertex
+  // counter (reset per frame, clamped to the cap by mcFinalize).
+  const bufMCTri = buf(MC_TRI.byteLength, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, MC_TRI);
+  const bufMCVerts = device.createBuffer({ size: MC_CAP * 32, usage: GPUBufferUsage.STORAGE });
+  const bufMCArgs = buf(16, GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST);
+  const mcArgsReset = new Uint32Array([0, 1, 0, 0]); // vertexCount, instances, firsts
 
   const alphaBlend = {
     color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -143,6 +172,8 @@ export async function createBackend({ canvas, fail }) {
   let thickBGGroup = null;
   let volBlurBG = null;
   let volBG = null;
+  let mcBG = null;
+  let meshBG = null;
   let substepCount = 0;
   let simBuffers = [];
 
@@ -168,6 +199,8 @@ export async function createBackend({ canvas, fail }) {
     const volBlurModule = device.createShaderModule({ code: S.volBlur });
     const volModule = device.createShaderModule({ code: S.volume });
     const volUpModule = device.createShaderModule({ code: S.volUpscale });
+    const mcModule = device.createShaderModule({ code: S.mcCompute });
+    const meshModule = device.createShaderModule({ code: S.mesh });
 
     const ST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     bufPos = buf(cfg.N * 16, ST | GPUBufferUsage.COPY_SRC, cfg.initialData);
@@ -291,6 +324,23 @@ export async function createBackend({ canvas, fail }) {
         fragment: { module: volUpModule, entryPoint: 'fsUpscale', targets: [{ format }] },
         primitive: { topology: 'triangle-list' },
       }),
+      mcEmit: device.createComputePipeline({
+        layout: mcPipeLayout,
+        compute: { module: mcModule, entryPoint: 'mcEmit' },
+      }),
+      mcFinalize: device.createComputePipeline({
+        layout: mcPipeLayout,
+        compute: { module: mcModule, entryPoint: 'mcFinalize' },
+      }),
+      // No culling (default): MC triangle winding is arbitrary and the
+      // fragment shader shades two-sided.
+      mesh: device.createRenderPipeline({
+        layout: meshPipeLayout,
+        vertex: { module: meshModule, entryPoint: 'vsMesh' },
+        fragment: { module: meshModule, entryPoint: 'fsMesh', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+        depthStencil: depthState,
+      }),
     };
 
     volBlurBG = device.createBindGroup({
@@ -305,6 +355,23 @@ export async function createBackend({ canvas, fail }) {
       entries: [
         { binding: 0, resource: { buffer: bufRenderU } },
         { binding: 1, resource: { buffer: bufVolDens } },
+      ],
+    });
+    mcBG = device.createBindGroup({
+      layout: mcLayout,
+      entries: [
+        { binding: 0, resource: { buffer: bufVolDens } },
+        { binding: 1, resource: { buffer: bufMCTri } },
+        { binding: 2, resource: { buffer: bufMCVerts } },
+        { binding: 3, resource: { buffer: bufMCArgs } },
+      ],
+    });
+    meshBG = device.createBindGroup({
+      layout: meshLayout,
+      entries: [
+        { binding: 0, resource: { buffer: bufRenderU } },
+        { binding: 1, resource: { buffer: bufMCVerts } },
+        { binding: 2, resource: { buffer: bufVolDens } },
       ],
     });
 
@@ -486,6 +553,45 @@ export async function createBackend({ canvas, fail }) {
       pass.draw(3);
       if (frame.gizmo) {
         pass.setPipeline(pipes.gizmo);
+        pass.setBindGroup(0, renderBGGroup);
+        pass.draw(130);
+      }
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      return;
+    }
+
+    if (frame.mode === 'mesh') {
+      // Marching-cubes isosurface: reuse the volume renderer's tent-blurred
+      // density, emit a triangle mesh (atomic slot reservation into a capped
+      // vertex pool + indirect args), then draw it depth-tested in the same
+      // pass as the raytraced background — real occlusion both ways.
+      device.queue.writeBuffer(bufMCArgs, 0, mcArgsReset);
+      const cpass = enc.beginComputePass();
+      cpass.setPipeline(pipes.volBlur);
+      cpass.setBindGroup(0, volBlurBG);
+      cpass.dispatchWorkgroups(Math.ceil(NCELL / 64));
+      cpass.setPipeline(pipes.mcEmit);
+      cpass.setBindGroup(0, mcBG);
+      cpass.dispatchWorkgroups(Math.ceil(NCELL / 64));
+      cpass.setPipeline(pipes.mcFinalize);
+      cpass.dispatchWorkgroups(1);
+      cpass.end();
+
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: canvasView, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
+        depthStencilAttachment: {
+          view: RT.v.sceneDepth, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1,
+        },
+      });
+      pass.setBindGroup(0, renderBGGroup);
+      pass.setPipeline(pipes.bgCanvas);
+      pass.draw(3);
+      pass.setPipeline(pipes.mesh);
+      pass.setBindGroup(0, meshBG);
+      pass.drawIndirect(bufMCArgs, 0);
+      if (frame.gizmo) {
+        pass.setPipeline(pipes.gizmoDepth);
         pass.setBindGroup(0, renderBGGroup);
         pass.draw(130);
       }

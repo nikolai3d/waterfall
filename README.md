@@ -98,7 +98,8 @@ normal, then follows one refracted ray through the interior — integrating
 Beer–Lambert absorption from the marched density — to the analytic
 walls-and-rocks background, with foam from the grid's momentum magnitude;
 it renders at a reduced resolution (`?rscale=`, default 0.5) and upscales;
-its iso threshold is fixed at 0.5 (`?iso=` affects the voxel renderer only).
+its iso threshold is fixed at 0.5 (`?iso=` affects the voxel and mesh
+renderers only).
 
 `?r=voxel` renders that same density grid as literal grid-aligned cubes
 (a deliberately chunky, Minecraft-water look that exposes the simulation's
@@ -111,6 +112,23 @@ one refracted continuation ray (also DDA) that Beer–Lambert-attenuates the
 analytic background by the water path length. It shares the volume
 renderer's blurred density field and scaled target (`?rscale=`).
 
+`?r=mesh` (WebGPU only) extracts a real triangle mesh from that same blurred
+density grid with **marching cubes**, recomputed on the GPU every frame: a
+compute kernel classifies each cell against the `?iso=` threshold (shared
+with the voxel renderer), reserves output slots with one atomic add on the
+indirect-draw args (the simple alternative to a prefix-sum scan — triangle
+order is arbitrary, which an opaque surface doesn't care about), and emits
+edge-interpolated vertices with density-gradient normals into a capped
+vertex pool (1.5M vertices, silently clamped if ever hit) drawn via
+`drawIndirect` with vertex pulling. The mesh is depth-tested in the same
+pass as the raytraced background, so water and rocks occlude each other
+geometrically. Shading is glassy water: Fresnel over the analytic scene
+continued along one refracted ray, Beer–Lambert absorption from a few
+interior density taps, and foam from the grid's momentum magnitude at the
+surface. Topology changes frame to frame, so mild temporal popping is
+inherent (the density blur keeps it tame). On WebGL2 the chip stays enabled
+but the mode renders the `ssf` path (with a console note).
+
 ## URL parameters
 
 | param  | default    | meaning                                            |
@@ -120,9 +138,9 @@ renderer's blurred density field and scaled target (`?rscale=`).
 | `s`    | `g` / 32   | simulation substeps per frame                      |
 | `l`    | 2600       | particle lifetime in substeps (spout recycling)    |
 | `warm` | 0          | substeps to pre-simulate before the first frame    |
-| `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume`, `voxel`, `aniso` |
+| `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume`, `voxel`, `aniso`, `mesh` (WebGPU only) |
 | `rscale`| 0.5       | offscreen target scale for `r=volume`/`r=voxel` (0.1–1) |
-| `iso`  | 1.5        | solid-cell density threshold for `r=voxel` (0.1–16) |
+| `iso`  | 1.5        | density threshold for `r=voxel` cells and the `r=mesh` isosurface (0.1–16) |
 | `k`    | 1.5        | splat elongation gain for `r=aniso` (0–4)          |
 | `api`  | auto       | backend: `webgpu` or `webgl2` (auto-detects)       |
 | `bench`| off        | time N frames after warmup, then freeze + report   |

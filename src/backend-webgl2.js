@@ -315,9 +315,18 @@ export async function createBackend({ canvas, fail }) {
     gl.disable(gl.BLEND);
   }
 
+  let meshNoted = false;
+
   function render(frame) {
     const { w, h, proj, view, pv, aspect, lightV } = frame;
     if (!RT || RT.w !== w || RT.h !== h) createTargets(w, h);
+
+    // r=mesh is WebGPU-only (compute marching cubes); unknown modes fall
+    // through to the screen-space fluid path below, so just note it once.
+    if (frame.mode === 'mesh' && !meshNoted) {
+      meshNoted = true;
+      console.warn('r=mesh needs WebGPU; rendering the ssf path instead.');
+    }
 
     if (frame.mode === 'volume' || frame.mode === 'voxel') {
       // Volumetric raymarch / voxel DDA: tent-blur the grid density, trace
