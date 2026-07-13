@@ -18,6 +18,7 @@ export function gridLayout(GRID) {
 
 export function makeShaders(opts) {
   const { GRID, PTEX, LIFE } = opts;
+  const ISO = opts.ISO ?? 1.5; // voxel renderer density threshold (?iso=)
   const { TILES, GTEX } = gridLayout(GRID);
   const s = GRID / 64;
   const vec3 = (a) => `vec3(${a.map((v) => v.toFixed(2)).join(', ')})`;
@@ -745,6 +746,47 @@ void main() {
 }
 `;
 
+  // Analytic scene (walls + rocks) for a ray starting inside the cube:
+  // trimmed copy of fsBackground. Returns rgb + hit distance. Shared by
+  // fsVolume and fsVoxel (expects uRocks/uLightW + sceneShade in scope).
+  const traceSceneGLSL = `
+vec4 traceScene(vec3 ro, vec3 rd) {
+  vec3 inv = 1.0 / rd;
+  vec3 ta = (vec3(-B) - ro) * inv;
+  vec3 tb = (vec3(B) - ro) * inv;
+  vec3 tmax3 = max(ta, tb);
+  float tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+  float tHit = tE;
+  vec3 nrm = vec3(0.0);
+  vec3 rockC = vec3(0.0);
+  float rockId = 0.0;
+  bool isRock = false;
+  for (int i = 0; i < NROCK; i++) {
+    vec3 c = uRocks[i].xyz * (2.0 / GRIDF) - 1.0;
+    float r = uRocks[i].w * (2.0 / GRIDF);
+    vec3 oc = ro - c;
+    float b = dot(oc, rd);
+    float h = b * b - (dot(oc, oc) - r * r);
+    if (h > 0.0) {
+      float t = -b - sqrt(h);
+      if (t > 1e-4 && t < tHit) {
+        tHit = t;
+        nrm = normalize(ro + rd * t - c);
+        rockC = c;
+        rockId = float(i);
+        isRock = true;
+      }
+    }
+  }
+
+  vec3 hit = ro + rd * tHit;
+  vec3 col = isRock ? shadeRock(hit, nrm, rockC, rockId, uLightW)
+                    : shadeWall(hit, uLightW);
+  return vec4(col, tHit);
+}
+`;
+
   // Fragment raymarch of the blurred density grid: iso-surface hit with
   // bisection refine, gradient normal, one refraction segment with
   // Beer-Lambert absorption from the marched interior density, and the
@@ -788,44 +830,7 @@ vec3 gradD(vec3 p) {
     density(p + vec3(0.0, 0.0, h)) - density(p - vec3(0.0, 0.0, h)));
 }
 
-// Analytic scene (walls + rocks) for a ray starting inside the cube:
-// trimmed copy of fsBackground. Returns rgb + hit distance.
-vec4 traceScene(vec3 ro, vec3 rd) {
-  vec3 inv = 1.0 / rd;
-  vec3 ta = (vec3(-B) - ro) * inv;
-  vec3 tb = (vec3(B) - ro) * inv;
-  vec3 tmax3 = max(ta, tb);
-  float tE = min(min(tmax3.x, tmax3.y), tmax3.z);
-
-  float tHit = tE;
-  vec3 nrm = vec3(0.0);
-  vec3 rockC = vec3(0.0);
-  float rockId = 0.0;
-  bool isRock = false;
-  for (int i = 0; i < NROCK; i++) {
-    vec3 c = uRocks[i].xyz * (2.0 / GRIDF) - 1.0;
-    float r = uRocks[i].w * (2.0 / GRIDF);
-    vec3 oc = ro - c;
-    float b = dot(oc, rd);
-    float h = b * b - (dot(oc, oc) - r * r);
-    if (h > 0.0) {
-      float t = -b - sqrt(h);
-      if (t > 1e-4 && t < tHit) {
-        tHit = t;
-        nrm = normalize(ro + rd * t - c);
-        rockC = c;
-        rockId = float(i);
-        isRock = true;
-      }
-    }
-  }
-
-  vec3 hit = ro + rd * tHit;
-  vec3 col = isRock ? shadeRock(hit, nrm, rockC, rockId, uLightW)
-                    : shadeWall(hit, uLightW);
-  return vec4(col, tHit);
-}
-
+` + traceSceneGLSL + `
 void main() {
   vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
   vec3 rd = normalize(uCamF + uCamR * uv.x * uTanF * uAspect + uCamU * uv.y * uTanF);
@@ -904,6 +909,157 @@ void main() {
 }
 `;
 
+  // --- Stylized voxel water (r=voxel) ------------------------------------
+
+  // Same blurred density field as fsVolume, but rendered as literal
+  // grid-aligned cubes: a DDA (Amanatides & Woo) walks the ray through
+  // cells and the first cell with density >= VISO is a cube-face hit with
+  // an axis-aligned normal. Chunky face shading, cell-edge darkening,
+  // whitecaps, and one refracted continuation ray (also DDA) attenuated
+  // Beer-Lambert-style toward the analytic background.
+  const fsVoxel = header + sceneShade + `
+uniform sampler2D uDens; // blurred (mass, |momentum|), tiled like the grid
+uniform vec3 uCamPos, uCamR, uCamU, uCamF;
+uniform vec2 uRes;       // scaled target size
+uniform float uTanF, uAspect;
+uniform vec3 uLightW;
+out vec4 o;
+
+const float VISO = ${ISO.toFixed(4)};  // per-cell density threshold (?iso=)
+const int MAXDDA = ${3 * GRID + 4};    // DDA worst case ~3*GRID cells
+const vec3 ABSORB = vec3(2.6, 1.0, 0.55);
+` + traceSceneGLSL + `
+vec2 cellDens(ivec3 c) {
+  if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(GRIDI)))) return vec2(0.0);
+  return gridFetch(uDens, c).xy;
+}
+
+// Grid traversal from roG (grid units) along rd (unit direction — uniform
+// world->grid scale keeps directions unchanged), capped at tEnd (grid
+// units). Returns the hit t (< 0 = miss) with face normal + cell.
+float voxMarch(vec3 roG, vec3 rd0, float tEnd, vec3 n0, out vec3 nOut, out ivec3 cellOut) {
+  vec3 rd = mix(rd0, vec3(1e-6), lessThan(abs(rd0), vec3(1e-6)));
+  ivec3 cell = clamp(ivec3(floor(roG)), ivec3(0), ivec3(GRIDI - 1));
+  ivec3 stp = ivec3(sign(rd));
+  vec3 inv = 1.0 / rd;
+  vec3 tDelta = abs(inv);
+  vec3 tMax = (vec3(cell) + max(sign(rd), 0.0) - roG) * inv;
+  float t = 0.0;
+  vec3 n = n0;
+  nOut = n0;
+  cellOut = cell;
+  for (int i = 0; i < MAXDDA; i++) {
+    if (cellDens(cell).x >= VISO) { nOut = n; cellOut = cell; return t; }
+    if (tMax.x < tMax.y && tMax.x < tMax.z) {
+      t = tMax.x; tMax.x += tDelta.x; cell.x += stp.x; n = vec3(-float(stp.x), 0.0, 0.0);
+    } else if (tMax.y < tMax.z) {
+      t = tMax.y; tMax.y += tDelta.y; cell.y += stp.y; n = vec3(0.0, -float(stp.y), 0.0);
+    } else {
+      t = tMax.z; tMax.z += tDelta.z; cell.z += stp.z; n = vec3(0.0, 0.0, -float(stp.z));
+    }
+    if (t > tEnd || any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(GRIDI)))) return -1.0;
+  }
+  return -1.0;
+}
+
+// Water path length (world units) through solid (>= VISO) cells along a ray.
+float voxThickness(vec3 roG, vec3 rd0, float tEnd) {
+  vec3 rd = mix(rd0, vec3(1e-6), lessThan(abs(rd0), vec3(1e-6)));
+  ivec3 cell = clamp(ivec3(floor(roG)), ivec3(0), ivec3(GRIDI - 1));
+  ivec3 stp = ivec3(sign(rd));
+  vec3 inv = 1.0 / rd;
+  vec3 tDelta = abs(inv);
+  vec3 tMax = (vec3(cell) + max(sign(rd), 0.0) - roG) * inv;
+  float t = 0.0;
+  float th = 0.0;
+  for (int i = 0; i < MAXDDA; i++) {
+    float tn = min(min(tMax.x, tMax.y), tMax.z);
+    if (cellDens(cell).x >= VISO) th += max(min(tn, tEnd) - t, 0.0);
+    if (tn > tEnd) break;
+    if (tMax.x < tMax.y && tMax.x < tMax.z) { tMax.x += tDelta.x; cell.x += stp.x; }
+    else if (tMax.y < tMax.z) { tMax.y += tDelta.y; cell.y += stp.y; }
+    else { tMax.z += tDelta.z; cell.z += stp.z; }
+    t = tn;
+    if (any(lessThan(cell, ivec3(0))) || any(greaterThanEqual(cell, ivec3(GRIDI)))) break;
+  }
+  return th * (2.0 / GRIDF);
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
+  vec3 rd = normalize(uCamF + uCamR * uv.x * uTanF * uAspect + uCamU * uv.y * uTanF);
+  vec3 ro = uCamPos;
+
+  vec3 inv = 1.0 / rd;
+  vec3 ta = (vec3(-B) - ro) * inv;
+  vec3 tb = (vec3(B) - ro) * inv;
+  vec3 tmin3 = min(ta, tb);
+  vec3 tmax3 = max(ta, tb);
+  float t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
+  float tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+  if (tE < max(t0, 0.0)) { // missed the cube: dark backdrop
+    float g = 1.0 - length(uv) * 0.45;
+    o = vec4(vec3(0.015, 0.02, 0.03) * g, 1.0);
+    return;
+  }
+
+  // Analytic scene hit caps the DDA (water behind a rock stays behind it).
+  vec3 entry = ro + rd * max(t0, 0.0);
+  vec4 sc = traceScene(entry, rd);
+
+  // Cube entry face doubles as the first cell's face normal.
+  vec3 n0 = vec3(0.0, 1.0, 0.0); // camera inside the cube: arbitrary
+  if (t0 > 0.0) {
+    if (t0 == tmin3.x)      n0 = vec3(-sign(rd.x), 0.0, 0.0);
+    else if (t0 == tmin3.y) n0 = vec3(0.0, -sign(rd.y), 0.0);
+    else                    n0 = vec3(0.0, 0.0, -sign(rd.z));
+  }
+
+  float G2 = GRIDF * 0.5;
+  vec3 roG = (entry + 1.0) * G2;
+  vec3 n;
+  ivec3 hitCell;
+  float tHit = voxMarch(roG, rd, sc.w * G2, n0, n, hitCell);
+  if (tHit < 0.0) { o = vec4(sc.rgb, 1.0); return; }
+
+  vec3 P = entry + rd * (tHit / G2);
+
+  // Chunky per-face diffuse; top faces read lighter, bottoms darker.
+  float diff = max(dot(n, uLightW), 0.0);
+  float shade = 0.55 + 0.45 * diff;
+  if (n.y > 0.5) shade *= 1.30;
+  if (n.y < -0.5) shade *= 0.60;
+
+  // ONE refracted continuation ray (also DDA): the analytic background
+  // attenuated Beer-Lambert-style by the water path length behind the face.
+  vec3 rd2 = refract(rd, n, 0.752); // 1 / 1.33
+  if (dot(rd2, rd2) < 1e-6) rd2 = reflect(rd, n);
+  rd2 = normalize(rd2);
+  vec4 sc2 = traceScene(P, rd2);
+  vec3 gp = roG + rd * tHit; // grid-space hit, nudged off the face below
+  float th = voxThickness(gp + rd2 * 0.01, rd2, sc2.w * G2);
+  vec3 bg = sc2.rgb * exp(ABSORB * (-6.0 * th));
+  bg += vec3(0.04, 0.16, 0.24) * (1.0 - exp(-th * 9.0)); // in-scatter
+
+  // Flat face-lit water tint over the refracted background (stylized alpha).
+  vec3 col = mix(bg, vec3(0.10, 0.38, 0.58) * shade, 0.72);
+
+  // Whitecaps where the cell's momentum magnitude / mass crosses a threshold.
+  vec2 d = cellDens(hitCell);
+  float speed = d.y / max(d.x, 1e-4) / VMAX;
+  float foam = smoothstep(0.45, 0.85, speed);
+  col = mix(col, vec3(0.93, 0.97, 1.0) * (0.75 + 0.25 * diff), foam * 0.9);
+
+  // Cell-edge darkening on the two tangential axes of the hit face.
+  vec3 ee = mix(min(fract(gp), 1.0 - fract(gp)), vec3(1.0), greaterThan(abs(n), vec3(0.5)));
+  float e = min(ee.x, min(ee.y, ee.z));
+  col *= mix(0.55, 1.0, smoothstep(0.02, 0.14, e));
+
+  o = vec4(col, 1.0);
+}
+`;
+
   // Upscale blit of the scaled volume target to the canvas.
   const fsVolUpscale = header + `
 uniform sampler2D uScene; // linear-filtered scaled target
@@ -951,7 +1107,7 @@ void main() {
     vsQuad, vsP2G1, vsP2G2, fsScatter, fsDensity, fsGrid, fsG2P,
     vsPoint, fsPoint, fsBackground,
     fsPointDepth, vsThick, fsThick, fsBlur, fsComposite, fsBlit,
-    fsVolBlur, fsVolume, fsVolUpscale,
+    fsVolBlur, fsVolume, fsVoxel, fsVolUpscale,
     vsGizmo, fsGizmo,
   };
 }

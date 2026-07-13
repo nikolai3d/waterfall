@@ -160,7 +160,7 @@ export async function createBackend({ canvas, fail }) {
     cfg = config;
     NCELL = cfg.GRID ** 3;
 
-    const S = makeWGSL({ GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N });
+    const S = makeWGSL({ GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N, ISO: cfg.ISO });
     const simModule = device.createShaderModule({ code: S.sim });
     const renderModule = device.createShaderModule({ code: S.render });
     const blurModule = device.createShaderModule({ code: S.blur });
@@ -263,6 +263,12 @@ export async function createBackend({ canvas, fail }) {
         layout: volPipeLayout,
         vertex: { module: volModule, entryPoint: 'vsFull' },
         fragment: { module: volModule, entryPoint: 'fsVolume', targets: [{ format: 'rgba8unorm' }] },
+        primitive: { topology: 'triangle-list' },
+      }),
+      voxel: device.createRenderPipeline({
+        layout: volPipeLayout,
+        vertex: { module: volModule, entryPoint: 'vsFull' },
+        fragment: { module: volModule, entryPoint: 'fsVoxel', targets: [{ format: 'rgba8unorm' }] },
         primitive: { topology: 'triangle-list' },
       }),
       volUpscale: device.createRenderPipeline({
@@ -441,9 +447,9 @@ export async function createBackend({ canvas, fail }) {
     const canvasView = context.getCurrentTexture().createView();
     const clearCol = { r: 0.01, g: 0.015, b: 0.02, a: 1 };
 
-    if (frame.mode === 'volume') {
-      // Volumetric raymarch: tent-blur the grid density (compute), raymarch
-      // it into a scaled offscreen target, then upscale to the canvas.
+    if (frame.mode === 'volume' || frame.mode === 'voxel') {
+      // Volumetric raymarch / voxel DDA: tent-blur the grid density
+      // (compute), trace it into a scaled offscreen target, upscale.
       const cpass = enc.beginComputePass();
       cpass.setPipeline(pipes.volBlur);
       cpass.setBindGroup(0, volBlurBG);
@@ -453,7 +459,7 @@ export async function createBackend({ canvas, fail }) {
       let pass = enc.beginRenderPass({
         colorAttachments: [{ view: RT.v.volColor, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
       });
-      pass.setPipeline(pipes.volume);
+      pass.setPipeline(frame.mode === 'voxel' ? pipes.voxel : pipes.volume);
       pass.setBindGroup(0, volBG);
       pass.draw(3);
       pass.end();

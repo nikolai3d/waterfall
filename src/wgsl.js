@@ -9,6 +9,7 @@ import { ROCKS } from './shaders.js';
 
 export function makeWGSL(opts) {
   const { GRID, LIFE, N } = opts;
+  const ISO = opts.ISO ?? 1.5; // voxel renderer density threshold (?iso=)
   const s = GRID / 64;
   const vec3f = (a) => `vec3f(${a.map((v) => v.toFixed(2)).join(', ')})`;
   const NROCK = ROCKS.length;
@@ -986,6 +987,150 @@ fn fsVolume(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   let speed = sd.y / max(sd.x, 1e-4) / VMAX;
   let foam = smoothstep(0.45, 0.9, speed);
   col = mix(col, vec3f(0.93, 0.97, 1.0), foam * 0.75);
+  return vec4f(col, 1.0);
+}
+
+// --- Stylized voxel water (r=voxel) ---------------------------------------
+// Same bindings and blurred density field as fsVolume, but the grid is
+// rendered as literal grid-aligned cubes: a DDA (Amanatides & Woo) walks the
+// ray through cells and the first cell with density >= VISO is a cube-face
+// hit with an axis-aligned normal.
+
+const VISO: f32 = ${ISO.toFixed(4)};  // per-cell density threshold (?iso=)
+const MAXDDA: i32 = ${3 * GRID + 4};  // DDA worst case ~3*GRID cells
+
+fn cellDens(c: vec3i) -> vec2f {
+  if (any(c < vec3i(0)) || any(c >= vec3i(GRIDI))) { return vec2f(0.0); }
+  return dens[cellIndex(c)];
+}
+
+struct VoxHit {
+  t: f32,       // grid units along the ray; < 0 = miss
+  n: vec3f,     // axis-aligned face normal of the hit cell
+  cell: vec3i,
+};
+
+// Grid traversal from roG (grid units) along rd (unit direction — uniform
+// world->grid scale keeps directions unchanged), capped at tEnd (grid units).
+fn voxMarch(roG: vec3f, rd0: vec3f, tEnd: f32, n0: vec3f) -> VoxHit {
+  let rd = select(rd0, vec3f(1e-6), abs(rd0) < vec3f(1e-6));
+  var cell = clamp(vec3i(floor(roG)), vec3i(0), vec3i(GRIDI - 1));
+  let stp = vec3i(sign(rd));
+  let inv = 1.0 / rd;
+  let tDelta = abs(inv);
+  var tMax = (vec3f(cell) + max(sign(rd), vec3f(0.0)) - roG) * inv;
+  var t = 0.0;
+  var n = n0;
+  var h: VoxHit;
+  h.t = -1.0; h.n = n0; h.cell = cell;
+  for (var i = 0; i < MAXDDA; i++) {
+    if (cellDens(cell).x >= VISO) { h.t = t; h.n = n; h.cell = cell; return h; }
+    if (tMax.x < tMax.y && tMax.x < tMax.z) {
+      t = tMax.x; tMax.x += tDelta.x; cell.x += stp.x; n = vec3f(-f32(stp.x), 0.0, 0.0);
+    } else if (tMax.y < tMax.z) {
+      t = tMax.y; tMax.y += tDelta.y; cell.y += stp.y; n = vec3f(0.0, -f32(stp.y), 0.0);
+    } else {
+      t = tMax.z; tMax.z += tDelta.z; cell.z += stp.z; n = vec3f(0.0, 0.0, -f32(stp.z));
+    }
+    if (t > tEnd || any(cell < vec3i(0)) || any(cell >= vec3i(GRIDI))) { return h; }
+  }
+  return h;
+}
+
+// Water path length (world units) through solid (>= VISO) cells along a ray.
+fn voxThickness(roG: vec3f, rd0: vec3f, tEnd: f32) -> f32 {
+  let rd = select(rd0, vec3f(1e-6), abs(rd0) < vec3f(1e-6));
+  var cell = clamp(vec3i(floor(roG)), vec3i(0), vec3i(GRIDI - 1));
+  let stp = vec3i(sign(rd));
+  let inv = 1.0 / rd;
+  let tDelta = abs(inv);
+  var tMax = (vec3f(cell) + max(sign(rd), vec3f(0.0)) - roG) * inv;
+  var t = 0.0;
+  var th = 0.0;
+  for (var i = 0; i < MAXDDA; i++) {
+    let tn = min(min(tMax.x, tMax.y), tMax.z);
+    if (cellDens(cell).x >= VISO) { th += max(min(tn, tEnd) - t, 0.0); }
+    if (tn > tEnd) { break; }
+    if (tMax.x < tMax.y && tMax.x < tMax.z) { tMax.x += tDelta.x; cell.x += stp.x; }
+    else if (tMax.y < tMax.z) { tMax.y += tDelta.y; cell.y += stp.y; }
+    else { tMax.z += tDelta.z; cell.z += stp.z; }
+    t = tn;
+    if (any(cell < vec3i(0)) || any(cell >= vec3i(GRIDI))) { break; }
+  }
+  return th * (2.0 / GRIDF);
+}
+
+@fragment
+fn fsVoxel(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+  var uv = frag.xy / R.misc.zw * 2.0 - vec2f(1.0);
+  uv.y = -uv.y; // framebuffer y is top-down in WebGPU
+  let rd = normalize(R.camF.xyz + R.camR.xyz * uv.x * R.res.z * R.res.w + R.camU.xyz * uv.y * R.res.z);
+  let ro = R.camPos.xyz;
+
+  let inv = 1.0 / rd;
+  let ta = (vec3f(-B) - ro) * inv;
+  let tb = (vec3f(B) - ro) * inv;
+  let tmin3 = min(ta, tb);
+  let tmax3 = max(ta, tb);
+  let t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
+  let tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+  if (tE < max(t0, 0.0)) { // missed the cube: dark backdrop
+    let g = 1.0 - length(uv) * 0.45;
+    return vec4f(vec3f(0.015, 0.02, 0.03) * g, 1.0);
+  }
+
+  // Analytic scene hit caps the DDA (water behind a rock stays behind it).
+  let entry = ro + rd * max(t0, 0.0);
+  let sc = traceScene(entry, rd);
+
+  // Cube entry face doubles as the first cell's face normal.
+  var n0 = vec3f(0.0, 1.0, 0.0); // camera inside the cube: arbitrary
+  if (t0 > 0.0) {
+    if (t0 == tmin3.x) { n0 = vec3f(-sign(rd.x), 0.0, 0.0); }
+    else if (t0 == tmin3.y) { n0 = vec3f(0.0, -sign(rd.y), 0.0); }
+    else { n0 = vec3f(0.0, 0.0, -sign(rd.z)); }
+  }
+
+  let G2 = GRIDF * 0.5;
+  let roG = (entry + vec3f(1.0)) * G2;
+  let hit = voxMarch(roG, rd, sc.w * G2, n0);
+  if (hit.t < 0.0) { return vec4f(sc.rgb, 1.0); }
+
+  let P = entry + rd * (hit.t / G2);
+  let n = hit.n;
+
+  // Chunky per-face diffuse; top faces read lighter, bottoms darker.
+  let diff = max(dot(n, R.lightW.xyz), 0.0);
+  var shade = 0.55 + 0.45 * diff;
+  if (n.y > 0.5) { shade *= 1.30; }
+  if (n.y < -0.5) { shade *= 0.60; }
+
+  // ONE refracted continuation ray (also DDA): the analytic background
+  // attenuated Beer-Lambert-style by the water path length behind the face.
+  var rd2 = refract(rd, n, 0.752); // 1 / 1.33
+  if (dot(rd2, rd2) < 1e-6) { rd2 = reflect(rd, n); }
+  rd2 = normalize(rd2);
+  let sc2 = traceScene(P, rd2);
+  let gp = roG + rd * hit.t; // grid-space hit, nudged off the face below
+  let th = voxThickness(gp + rd2 * 0.01, rd2, sc2.w * G2);
+  var bg = sc2.rgb * exp(ABSORB * (-6.0 * th));
+  bg += vec3f(0.04, 0.16, 0.24) * (1.0 - exp(-th * 9.0)); // in-scatter
+
+  // Flat face-lit water tint over the refracted background (stylized alpha).
+  var col = mix(bg, vec3f(0.10, 0.38, 0.58) * shade, 0.72);
+
+  // Whitecaps where the cell's momentum magnitude / mass crosses a threshold.
+  let d = cellDens(hit.cell);
+  let speed = d.y / max(d.x, 1e-4) / VMAX;
+  let foam = smoothstep(0.45, 0.85, speed);
+  col = mix(col, vec3f(0.93, 0.97, 1.0) * (0.75 + 0.25 * diff), foam * 0.9);
+
+  // Cell-edge darkening on the two tangential axes of the hit face.
+  let ee = select(min(fract(gp), vec3f(1.0) - fract(gp)), vec3f(1.0), abs(n) > vec3f(0.5));
+  let e = min(ee.x, min(ee.y, ee.z));
+  col *= mix(0.55, 1.0, smoothstep(0.02, 0.14, e));
+
   return vec4f(col, 1.0);
 }
 `;

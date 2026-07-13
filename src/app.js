@@ -16,10 +16,16 @@ let PTEX = parseInt(params.get('p') || '384', 10);
 if (!(PTEX >= 4 && PTEX <= 2048)) PTEX = 384;
 const LIFE = parseInt(params.get('l') || '2600', 10);
 
-// Volume renderer offscreen scale (?rscale=, default 0.5 — the raymarch is
-// heavy at full resolution; the low-res target is load-bearing).
+// Volume/voxel renderer offscreen scale (?rscale=, default 0.5 — the
+// raymarch is heavy at full resolution; the low-res target is load-bearing).
 let RSCALE = parseFloat(params.get('rscale') || '0.5');
 if (!(RSCALE >= 0.1 && RSCALE <= 1)) RSCALE = 0.5;
+
+// Voxel renderer density threshold (?iso=, particles/cell). The blurred
+// grid rests at ~4/cell but surface cells are half-empty, so ~1.5 is the
+// sweet spot; garbage or out-of-range values fall back to the default.
+let ISO = parseFloat(params.get('iso') || '1.5');
+if (!(ISO >= 0.1 && ISO <= 16)) ISO = 1.5;
 
 // The CFL clamp caps velocity in cells/substep, so finer grids need more
 // substeps per frame to move at the same world-space speed.
@@ -124,7 +130,7 @@ function initialParticleData() {
 function config() {
   N = PTEX * PTEX;
   updateRockData();
-  return { GRID, PTEX, LIFE, N, RSCALE, initialData: initialParticleData(), rockData, rockVel };
+  return { GRID, PTEX, LIFE, N, RSCALE, ISO, initialData: initialParticleData(), rockData, rockVel };
 }
 
 backend.init(config());
@@ -348,7 +354,7 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-let renderMode = ['points', 'ssf', 'volume'].includes(params.get('r')) ? params.get('r') : 'ssf';
+let renderMode = ['points', 'ssf', 'volume', 'voxel'].includes(params.get('r')) ? params.get('r') : 'ssf';
 
 // Resolution panel: changing a value rebuilds the whole sim in place
 // (camera and pause state survive); the URL stays shareable.
@@ -498,7 +504,7 @@ function tick(now) {
     const fps = (frames * 1000) / (now - lastFps);
     statsEl.textContent =
       `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${renderMode}` +
-      (renderMode === 'volume' ? ` rscale=${RSCALE}` : '') + ` · ${backend.name}` +
+      (renderMode === 'volume' || renderMode === 'voxel' ? ` rscale=${RSCALE}` : '') + ` · ${backend.name}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;
