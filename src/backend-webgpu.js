@@ -12,13 +12,6 @@ import { makeWGSL } from './wgsl.js';
 
 const NROCK = ROCKS.length;
 
-// Volume renderer offscreen scale (?rscale=, default 0.5 — the raymarch is
-// heavy at full resolution; the low-res target is load-bearing).
-function renderScale() {
-  const v = parseFloat(new URLSearchParams(location.search).get('rscale') || '0.5');
-  return v >= 0.1 && v <= 1 ? v : 0.5;
-}
-
 export async function createBackend({ canvas, fail }) {
   if (!navigator.gpu) fail('WebGPU is not available in this browser.');
   const adapter = await navigator.gpu.requestAdapter();
@@ -98,7 +91,7 @@ export async function createBackend({ canvas, fail }) {
       { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
     ],
   });
-  // Volume renderer: grid box blur (compute), raymarch (density buffer
+  // Volume renderer: grid tent blur (compute), raymarch (density buffer
   // read-only in a fragment stage), and the upscale blit.
   const volBlurLayout = device.createBindGroupLayout({
     entries: [
@@ -126,7 +119,6 @@ export async function createBackend({ canvas, fail }) {
   const volBlurPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volBlurLayout] });
   const volPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volLayout] });
   const volUpPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volUpLayout] });
-  const RSCALE = renderScale();
 
   const alphaBlend = {
     color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -273,7 +265,7 @@ export async function createBackend({ canvas, fail }) {
         fragment: { module: volModule, entryPoint: 'fsVolume', targets: [{ format: 'rgba8unorm' }] },
         primitive: { topology: 'triangle-list' },
       }),
-      volUp: device.createRenderPipeline({
+      volUpscale: device.createRenderPipeline({
         layout: volUpPipeLayout,
         vertex: { module: volUpModule, entryPoint: 'vsFull' },
         fragment: { module: volUpModule, entryPoint: 'fsUpscale', targets: [{ format }] },
@@ -377,8 +369,8 @@ export async function createBackend({ canvas, fail }) {
     const blurA = tex('r32float', w, h);
     const blurB = tex('r32float', w, h);
     const thick = tex('rgba16float', hw, hh);
-    const volW = Math.max(1, Math.round(w * RSCALE));
-    const volH = Math.max(1, Math.round(h * RSCALE));
+    const volW = Math.max(1, Math.round(w * cfg.RSCALE));
+    const volH = Math.max(1, Math.round(h * cfg.RSCALE));
     const volColor = tex('rgba8unorm', volW, volH);
 
     const v = {
@@ -444,16 +436,13 @@ export async function createBackend({ canvas, fail }) {
   function render(frame) {
     ensureTargets(frame.w, frame.h);
     writeRenderU(frame);
-    const scalePx = frame.h * frame.proj[5];
-    device.queue.writeBuffer(bufBlurX, 0, new Float32Array([1, 0, scalePx, 0]));
-    device.queue.writeBuffer(bufBlurY, 0, new Float32Array([0, 1, scalePx, 0]));
 
     const enc = device.createCommandEncoder();
     const canvasView = context.getCurrentTexture().createView();
     const clearCol = { r: 0.01, g: 0.015, b: 0.02, a: 1 };
 
     if (frame.mode === 'volume') {
-      // Volumetric raymarch: box-blur the grid density (compute), raymarch
+      // Volumetric raymarch: tent-blur the grid density (compute), raymarch
       // it into a scaled offscreen target, then upscale to the canvas.
       const cpass = enc.beginComputePass();
       cpass.setPipeline(pipes.volBlur);
@@ -472,7 +461,7 @@ export async function createBackend({ canvas, fail }) {
       pass = enc.beginRenderPass({
         colorAttachments: [{ view: canvasView, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
       });
-      pass.setPipeline(pipes.volUp);
+      pass.setPipeline(pipes.volUpscale);
       pass.setBindGroup(0, RT.volUpBG);
       pass.draw(3);
       if (frame.gizmo) {
@@ -529,6 +518,9 @@ export async function createBackend({ canvas, fail }) {
     pass.end();
 
     // 3. depth-aware separable blur, two iterations
+    const scalePx = frame.h * frame.proj[5];
+    device.queue.writeBuffer(bufBlurX, 0, new Float32Array([1, 0, scalePx, 0]));
+    device.queue.writeBuffer(bufBlurY, 0, new Float32Array([0, 1, scalePx, 0]));
     for (const [outView, bg] of [
       [RT.v.blurA, RT.blurBGs[0]], [RT.v.blurB, RT.blurBGs[1]],
       [RT.v.blurA, RT.blurBGs[2]], [RT.v.blurB, RT.blurBGs[1]],

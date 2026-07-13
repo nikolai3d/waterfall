@@ -23,7 +23,7 @@ python3 -m http.server 8123
 
 Controls: **drag a rock** to move it (the water is pushed aside as it goes),
 **drag** elsewhere to orbit, **wheel** to zoom, **space** to pause,
-**f** to toggle between the water surface and raw particle view. The panel
+**f** to cycle through the renderers. The panel
 in the top-right corner adjusts grid resolution (32³–128³) and particle
 count (128²–512²); changing either restarts the water in place (the camera
 survives).
@@ -77,10 +77,10 @@ specular, and foam. The blur uses narrow-range lower-bound clamping
 ones, and the thickness pass culls water well behind the visible surface
 (tested against the raw per-pixel depth), so the pool neither shows
 through the stream in front of it nor punches fake holes around it.
-Press **f** (or `?r=points`) for the raw shaded-particle view.
+Use `?r=points` (or cycle with **f**) for the raw shaded-particle view.
 
 `?r=volume` instead raymarches the simulation's own density grid as a true
-3D volume: a fragment shader marches the (box-blurred) grid mass to an
+3D volume: a fragment shader marches the (tent-blurred) grid mass to an
 iso-surface, refines the hit by bisection, shades with a density-gradient
 normal, then follows one refracted ray through the interior — integrating
 Beer–Lambert absorption from the marched density — to the analytic

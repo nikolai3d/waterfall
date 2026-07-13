@@ -337,6 +337,59 @@ fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
 }
 `;
 
+  // Shared hit-point shading for the analytic scene, appended into BOTH the
+  // render module (fsBackground) and the volume module (whose traceScene
+  // reuses the same look), so a wall/rock look tweak is one edit per
+  // language (see shaders.js for GLSL). Intersection logic stays with each
+  // shader.
+  const sceneShade = `
+const B: f32 = ${(1 - 4 / GRID).toFixed(6)}; // wall extent (cells 2..GRIDI-2)
+
+// Rock: noise in rock-local coordinates (offset per rock), so the texture
+// is attached to the rock and moves with it when dragged, instead of the
+// rock sliding through a fixed world-space noise volume.
+fn shadeRock(hit: vec3f, nrm0: vec3f, rockC: vec3f, rockId: f32, lightW: vec3f) -> vec3f {
+  let cell = floor((hit - rockC) * 60.0 + vec3f(rockId * 23.0));
+  let n1 = hash1(cell);
+  let n2 = hash1(cell + vec3f(17.0));
+  let n3 = hash1(cell + vec3f(43.0));
+  let nrm = normalize(nrm0 + (vec3f(n1, n2, n3) - vec3f(0.5)) * 0.35);
+  let diff = max(dot(nrm, lightW), 0.0);
+  let ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
+  let base = mix(vec3f(0.30, 0.27, 0.24), vec3f(0.42, 0.40, 0.37), n1);
+  return base * (0.30 + 0.75 * diff) * ao;
+}
+
+// Wall/floor: base color with subtle grid lines every 8 sim cells and a
+// faint glow along the cube edges.
+fn shadeWall(hit: vec3f, lightW: vec3f) -> vec3f {
+  let a = abs(hit) / B;
+  var n: vec3f;
+  if (a.x > a.y && a.x > a.z) { n = vec3f(-sign(hit.x), 0.0, 0.0); }
+  else if (a.y > a.z) { n = vec3f(0.0, -sign(hit.y), 0.0); }
+  else { n = vec3f(0.0, 0.0, -sign(hit.z)); }
+  var base = vec3f(0.065, 0.075, 0.09);
+  if (n.y > 0.5) { base = vec3f(0.10, 0.11, 0.125); }
+  let diff = max(dot(n, lightW), 0.0);
+  var col = base * (0.5 + 0.5 * diff);
+
+  var tuv: vec2f;
+  if (abs(n.x) > 0.5) { tuv = hit.yz; }
+  else if (abs(n.y) > 0.5) { tuv = hit.xz; }
+  else { tuv = hit.xy; }
+  let g2 = abs(fract(tuv * (GRIDF / 16.0)) - vec2f(0.5)) / (GRIDF / 16.0);
+  let line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
+  col *= mix(1.3, 1.0, line);
+
+  let sd = vec3f(B) - abs(hit);
+  let m1 = min(sd.x, min(sd.y, sd.z));
+  let mx = max(sd.x, max(sd.y, sd.z));
+  let mid = sd.x + sd.y + sd.z - m1 - mx;
+  col += vec3f(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+  return col;
+}
+`;
+
   // Background: analytic raytrace of the cube interior and rock spheres,
   // writing real depth so water composites against it.
   const renderBG = `
@@ -344,8 +397,6 @@ struct BGOut {
   @location(0) col: vec4f,
   @builtin(frag_depth) depth: f32,
 };
-
-const B: f32 = ${(1 - 4 / GRID).toFixed(6)}; // wall extent (cells 2..GRIDI-2)
 
 @fragment
 fn fsBackground(@builtin(position) frag: vec4f) -> BGOut {
@@ -397,44 +448,10 @@ fn fsBackground(@builtin(position) frag: vec4f) -> BGOut {
   var col: vec3f;
   if (isRock) {
     hit = camPos + rd * tR;
-    // Noise in rock-local coordinates so the texture moves with the rock.
-    let cell = floor((hit - rockC) * 60.0 + vec3f(rockId * 23.0));
-    let n1 = hash1(cell);
-    let n2 = hash1(cell + vec3f(17.0));
-    let n3 = hash1(cell + vec3f(43.0));
-    nrm = normalize(nrm + (vec3f(n1, n2, n3) - vec3f(0.5)) * 0.35);
-    let diff = max(dot(nrm, R.lightW.xyz), 0.0);
-    let ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
-    let base = mix(vec3f(0.30, 0.27, 0.24), vec3f(0.42, 0.40, 0.37), n1);
-    col = base * (0.30 + 0.75 * diff) * ao;
+    col = shadeRock(hit, nrm, rockC, rockId, R.lightW.xyz);
   } else {
     hit = camPos + rd * tE; // exit face = visible back wall or floor
-    let a = abs(hit) / B;
-    var n: vec3f;
-    if (a.x > a.y && a.x > a.z) { n = vec3f(-sign(hit.x), 0.0, 0.0); }
-    else if (a.y > a.z) { n = vec3f(0.0, -sign(hit.y), 0.0); }
-    else { n = vec3f(0.0, 0.0, -sign(hit.z)); }
-    let isFloor = n.y > 0.5;
-    var base = vec3f(0.065, 0.075, 0.09);
-    if (isFloor) { base = vec3f(0.10, 0.11, 0.125); }
-    let diff = max(dot(n, R.lightW.xyz), 0.0);
-    col = base * (0.5 + 0.5 * diff);
-
-    // Subtle grid lines every 8 sim cells.
-    var tuv: vec2f;
-    if (abs(n.x) > 0.5) { tuv = hit.yz; }
-    else if (abs(n.y) > 0.5) { tuv = hit.xz; }
-    else { tuv = hit.xy; }
-    let g2 = abs(fract(tuv * (GRIDF / 16.0)) - 0.5) / (GRIDF / 16.0);
-    let line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
-    col *= mix(1.3, 1.0, line);
-
-    // Faint glow along cube edges.
-    let sd = vec3f(B) - abs(hit);
-    let m1 = min(sd.x, min(sd.y, sd.z));
-    let mx = max(sd.x, max(sd.y, sd.z));
-    let mid = sd.x + sd.y + sd.z - m1 - mx;
-    col += vec3f(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+    col = shadeWall(hit, R.lightW.xyz);
   }
 
   let clip = R.pv * vec4f(hit, 1.0);
@@ -775,7 +792,7 @@ fn fsComposite(@builtin(position) frag: vec4f) -> @location(0) vec4f {
 
   // --- Volumetric raymarcher (r=volume) ------------------------------------
 
-  // One-cell box blur of the sim grid's (velocity, mass) field into a small
+  // One-cell tent blur of the sim grid's (velocity, mass) field into a small
   // dedicated (mass, |momentum|) buffer: the raw per-substep mass is too
   // speckly (4 particles/cell at rest) for a stable iso-surface.
   const volBlur = common + `
@@ -812,11 +829,10 @@ fn blurGrid(@builtin(global_invocation_id) gid: vec3u) {
   // Beer-Lambert absorption from the marched interior density, and the
   // analytic scene (walls + rocks) continued along the refracted ray.
   // Renders into a scaled offscreen target (see misc.zw), upscaled after.
-  const volume = common + renderUStruct + `
+  const volume = common + renderUStruct + sceneShade + `
 @group(0) @binding(0) var<uniform> R: RenderU;
 @group(0) @binding(1) var<storage, read> dens: array<vec2f>; // blurred (mass, |momentum|)
 
-const B: f32 = ${(1 - 4 / GRID).toFixed(6)};
 const ISO: f32 = 0.5;            // iso-surface threshold, particles/cell
 const STEP: f32 = ${(1 / GRID).toFixed(6)};  // 0.5 grid cells, world units
 const MAXIT: i32 = ${Math.ceil(3.5 * GRID)}; // covers the cube diagonal
@@ -887,39 +903,9 @@ fn traceScene(ro: vec3f, rd: vec3f) -> vec4f {
   let hit = ro + rd * tHit;
   var col: vec3f;
   if (isRock) {
-    let cell = floor((hit - rockC) * 60.0 + vec3f(rockId * 23.0));
-    let n1 = hash1(cell);
-    let n2 = hash1(cell + vec3f(17.0));
-    let n3 = hash1(cell + vec3f(43.0));
-    nrm = normalize(nrm + (vec3f(n1, n2, n3) - vec3f(0.5)) * 0.35);
-    let diff = max(dot(nrm, R.lightW.xyz), 0.0);
-    let ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
-    let base = mix(vec3f(0.30, 0.27, 0.24), vec3f(0.42, 0.40, 0.37), n1);
-    col = base * (0.30 + 0.75 * diff) * ao;
+    col = shadeRock(hit, nrm, rockC, rockId, R.lightW.xyz);
   } else {
-    let a = abs(hit) / B;
-    var n: vec3f;
-    if (a.x > a.y && a.x > a.z) { n = vec3f(-sign(hit.x), 0.0, 0.0); }
-    else if (a.y > a.z) { n = vec3f(0.0, -sign(hit.y), 0.0); }
-    else { n = vec3f(0.0, 0.0, -sign(hit.z)); }
-    var base = vec3f(0.065, 0.075, 0.09);
-    if (n.y > 0.5) { base = vec3f(0.10, 0.11, 0.125); }
-    let diff = max(dot(n, R.lightW.xyz), 0.0);
-    col = base * (0.5 + 0.5 * diff);
-
-    var tuv: vec2f;
-    if (abs(n.x) > 0.5) { tuv = hit.yz; }
-    else if (abs(n.y) > 0.5) { tuv = hit.xz; }
-    else { tuv = hit.xy; }
-    let g2 = abs(fract(tuv * (GRIDF / 16.0)) - vec2f(0.5)) / (GRIDF / 16.0);
-    let line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
-    col *= mix(1.3, 1.0, line);
-
-    let sd = vec3f(B) - abs(hit);
-    let m1 = min(sd.x, min(sd.y, sd.z));
-    let mx = max(sd.x, max(sd.y, sd.z));
-    let mid = sd.x + sd.y + sd.z - m1 - mx;
-    col += vec3f(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+    col = shadeWall(hit, R.lightW.xyz);
   }
   return vec4f(col, tHit);
 }
@@ -1031,7 +1017,7 @@ fn fsUpscale(v: UpVSOut) -> @location(0) vec4f {
 
   return {
     sim,
-    render: renderCommon + renderBG + renderPoints + renderSSF,
+    render: renderCommon + sceneShade + renderBG + renderPoints + renderSSF,
     blur,
     composite,
     volBlur,
