@@ -7,7 +7,7 @@ fallback that emulates compute with render passes).
 
 ![screenshot](docs/screenshot.png)
 
-**Live physics, no baked animation:** ~65,000 fluid particles simulated with
+**Live physics, no baked animation:** ~262,000 fluid particles simulated with
 **MLS-MPM** (Moving Least Squares Material Point Method, [Hu et al.,
 SIGGRAPH 2018](https://yuanming.taichi.graphics/publication/2018-mlsmpm/)),
 the same family of methods behind most modern real-time fluid demos.
@@ -25,7 +25,7 @@ Controls: **drag a rock** to move it (the water is pushed aside as it goes),
 **drag** elsewhere to orbit, **wheel** to zoom, **space** to pause,
 **f** to toggle between the water surface and raw particle view. The panel
 in the top-right corner adjusts grid resolution (32³–128³) and particle
-count (128²–384²); changing either restarts the water in place (the camera
+count (128²–512²); changing either restarts the water in place (the camera
 survives).
 
 ## How it works
@@ -81,8 +81,8 @@ visible — visually minor.
 
 | param  | default    | meaning                                            |
 | ------ | ---------- | -------------------------------------------------- |
-| `g`    | 64         | grid resolution per axis (32, 64, 96, or 128)      |
-| `p`    | 256        | particle texture size (`p`² particles)             |
+| `g`    | 128        | grid resolution per axis (32, 64, 96, or 128)      |
+| `p`    | 512        | particle texture size (`p`² particles)             |
 | `s`    | `g` / 32   | simulation substeps per frame                      |
 | `l`    | 2600       | particle lifetime in substeps (spout recycling)    |
 | `warm` | 0          | substeps to pre-simulate before the first frame    |
