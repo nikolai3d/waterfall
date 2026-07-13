@@ -38,19 +38,27 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
   the chip stays enabled but the mode renders the `ssf` path (console note,
   no error overlay), so a `?api=webgl2&r=mesh` shot must look like `r=ssf`.
 - `?r=trace` is the progressive path tracer — WebGPU only, same fallback
-  contract as mesh (`trace→ssf` on WebGL2). Selecting it (URL or chip)
+  contract as mesh (`trace→ssf` on WebGL2), and the auto-pause is gated on
+  the EFFECTIVE mode: on WebGL2 the fallback keeps the sim RUNNING, so a
+  `?api=webgl2&r=trace` shot must look like a running `r=ssf`, not a frozen
+  one. Where trace actually renders (WebGPU), selecting it (URL or chip)
   auto-pauses the sim; the stats line reads
-  `… trace rscale=0.5 spp=N · webgpu · paused`, where `spp=` counts
-  accumulated samples (frames since the last accumulation reset × `?spp=`,
-  which is 1–8 paths/pixel/frame; `?bounces=` 1–8 is max path depth — both
-  baked at init, garbage falls back to defaults). The accumulation resets
-  on camera orbit, rock drag, sim steps, and panel changes — assert `spp=`
-  dropping to a small value to prove a reset, or growing large to prove
-  convergence. "Let it cook" needs REAL time: under virtual time only a
-  handful of frames accumulate, so converged shots come from a real-time
-  harness run. Gotcha shared by all grid-density renderers
-  (volume/voxel/mesh/trace): after a grid/particles chip change while
-  paused, there is no water until the sim advances (fresh grid is empty).
+  `… trace rscale=0.5 spp=N (xM) bounces=K · webgpu · paused`, where `spp=`
+  counts accumulated samples (frames since the last accumulation reset ×
+  `?spp=`), `(xM)` echoes the `?spp=` setting (1–8 paths/pixel/frame) and
+  `bounces=K` the `?bounces=` setting (1–8 max path depth — both baked at
+  init, garbage falls back to defaults `(x1) bounces=4`). The accumulation
+  resets on camera orbit, zoom, resize, sim steps, panel changes, and rock
+  drags — but a rock drag only while the sim runs (paused drags move
+  nothing, so they reset nothing). Stats refresh every 500ms while the
+  accumulation advances ~every frame, so the exact post-reset `spp=1` is
+  never observable — assert `spp=` dropping to a small value to prove a
+  reset, or growing large to prove convergence. "Let it cook" needs REAL
+  time: under virtual time only a handful of frames accumulate, so
+  converged shots come from a real-time harness run. Gotcha shared by all
+  grid-density renderers (volume/voxel/mesh/trace): after a grid/particles
+  chip change while paused, there is no water until the sim advances
+  (fresh grid is empty).
 - Evidence for WebGPU-only modes (`r=mesh`, `r=trace`) must pin `?api=webgpu` AND
   stats-assert BOTH the mode token and the backend name. Two markers make a
   silent fallback impossible to mistake for the real thing: when the auto
@@ -66,8 +74,8 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
   default, and `?k=0` looks like `r=ssf`).
 - The stats line shows the active render mode (and, in volume/voxel/trace
   modes, the effective `rscale=`; in voxel and mesh modes also `iso=`; in
-  aniso mode `k=`; in trace mode the accumulated `spp=`) — assert on it in
-  harnesses to confirm a mode/param took effect.
+  aniso mode `k=`; in trace mode the accumulated `spp=N (xM) bounces=K`) —
+  assert on it in harnesses to confirm a mode/param took effect.
 - macOS has no `timeout` command.
 
 ## Driving the UI (clicks) headlessly

@@ -376,11 +376,16 @@ let renderMode = ['points', 'ssf', 'volume', 'voxel', 'aniso', 'mesh', 'trace'].
 // r=trace is a progressive accumulator ("let it cook"): entering it pauses
 // the sim so the image can converge; space toggles as always (a running sim
 // resets the accumulation every frame = live noisy preview). Leaving trace
-// does not auto-unpause.
-if (renderMode === 'trace') paused = true;
+// does not auto-unpause. Gated on the EFFECTIVE mode: WebGL2 renders
+// trace as its ssf fallback, which must keep running, not freeze.
+function pauseIfTrace(m) {
+  const eff = backend.effectiveMode ? backend.effectiveMode(m) : m;
+  if (eff === 'trace') paused = true;
+}
+pauseIfTrace(renderMode);
 
 function setRenderMode(m) {
-  if (m === 'trace' && renderMode !== 'trace') paused = true;
+  if (m !== renderMode) pauseIfTrace(m);
   renderMode = m;
   syncURL();
   syncPanel();
@@ -567,7 +572,7 @@ function tick(now) {
       (eff === 'volume' || eff === 'voxel' || eff === 'trace' ? ` rscale=${RSCALE}` : '') +
       (eff === 'voxel' || eff === 'mesh' ? ` iso=${ISO}` : '') +
       (eff === 'aniso' ? ` k=${K}` : '') +
-      (eff === 'trace' ? ` spp=${accFrames * SPP}` : '') + ` · ${backendLabel}` +
+      (eff === 'trace' ? ` spp=${accFrames * SPP} (x${SPP}) bounces=${BOUNCES}` : '') + ` · ${backendLabel}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;

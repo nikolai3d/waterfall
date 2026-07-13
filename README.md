@@ -151,10 +151,14 @@ two bounces (`?bounces=` caps depth). The accumulation is tone-mapped
 (exposure + Reinhard) and upscaled from the `?rscale=` target. Selecting
 trace **pauses the simulation** so the image can converge — space resumes
 as always (while the sim runs, the accumulation restarts every frame: a
-live noisy preview); any camera move, rock drag, sim step, or panel change
-also restarts it, and the stats line counts the accumulated samples
-(`spp=`). On WebGL2 the chip falls back to the `ssf` path (`trace→ssf` in
-the stats line). Note that after a grid/particles change while paused, the
+live noisy preview); any camera orbit or zoom, sim step, resize, or panel
+change also restarts it — a rock drag too, but only while the sim runs (a
+paused drag moves nothing, so it resets nothing) — and the stats line
+reads `spp=N (xM) bounces=K`: accumulated samples, then the `?spp=` and
+`?bounces=` settings. On WebGL2 the chip falls back to the `ssf` path
+(`trace→ssf` in the stats line) and the sim keeps running — the auto-pause
+applies only where trace actually renders. Note that after a
+grid/particles change while paused, the
 grid-density renderers (volume, voxel, mesh, trace) show no water until the
 sim advances — the freshly rebuilt grid is empty until the first substep.
 
@@ -178,6 +182,8 @@ sim advances — the freshly rebuilt grid is empty until the first substep.
 | `dbg`  | off        | overlay with GPU-readback particle statistics      |
 
 Example: [`?p=128&s=3`](http://localhost:8123/?p=128&s=3) for slower machines.
+Maxed-out tracer settings (`spp=8`, `bounces=8`, `g=128`, `rscale=1`) are
+heavy and can stress weaker GPUs.
 
 ## Requirements
 
