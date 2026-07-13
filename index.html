@@ -32,6 +32,11 @@
     }
     #panel button:hover { border-color: rgba(215, 230, 242, .7); }
     #panel button.on { background: #2b4a63; color: #d7e6f2; border-color: #6d90ac; }
+    #drag {
+      display: none; padding: 2px 8px; color: #d7e6f2;
+      background: rgba(6, 11, 17, .7); border: 1px solid rgba(159, 180, 196, .25);
+      border-radius: 6px; white-space: nowrap;
+    }
     #err {
       display: none; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
       max-width: 40em; padding: 16px 20px; background: #2a1215; color: #ffb4b4;
@@ -49,7 +54,8 @@
     <div class="row"><span class="lbl">particles</span><button data-p="128">128²</button><button data-p="192">192²</button><button data-p="256">256²</button><button data-p="384">384²</button></div>
     <div class="note">changing a value restarts the water</div>
   </div>
-  <div id="help" class="hud">drag — orbit · wheel — zoom · space — pause · f — surface/particles</div>
+  <div id="drag" class="hud"></div>
+  <div id="help" class="hud">drag rock — move it · drag — orbit · wheel — zoom · space — pause · f — surface/particles</div>
   <div id="err"></div>
   <script type="module" src="src/main.js"></script>
 </body>

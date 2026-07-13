@@ -36,8 +36,26 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
 `--screenshot` can't click. Write a temporary same-origin harness page in the
 repo root (e.g. `_verify_ui.html`, delete after) that iframes `/?...`, waits
 for `load` (module script incl. warmup runs before it), then dispatches
-`.click()` on `#panel button[data-g=...]` / `[data-p=...]` chips and
-keyboard events on the iframe window, logging iframe `location.search`,
-`#stats` text, `#err` visibility, and `webglcontextlost` into an outer
-`<pre>` so the screenshot doubles as the report. Use generous virtual-time
-budget (15000+) and sleeps between actions.
+`.click()` on `#panel button[data-g=...]` / `[data-p=...]` chips, synthetic
+`MouseEvent`s on the canvas (drags), and keyboard events on the iframe
+window, logging iframe `location.search`, `#stats` text, `#err` visibility,
+and `webglcontextlost`. The hover cursor (`move` over a rock) lets the
+harness *find* draggable objects by scanning mousemoves and reading
+`canvas.style.cursor` — assert drags via the shift of the hover-hit centroid.
+
+**Virtual time cannot drive frame-dependent interactions.** Under
+`--screenshot --virtual-time-budget`, rAF may fire only a handful of times
+total (observed: 3) no matter the budget, so anything that advances per
+frame while a button is held (e.g. a dragged rock chasing its target) barely
+moves, and awaiting the iframe's rAF can hang forever. For those flows run
+headless Chrome in **real time** instead:
+
+- launch `--headless=new --remote-debugging-port=9333 <url>` in the
+  background (the debug port keeps it alive), sleep ~30 s, kill it;
+- no screenshot flag works there, so the harness ships evidence out over
+  HTTP: each `log()` line as `fetch('/HARNESS/<seq>/<encoded>')` picked up
+  from the `python3 -m http.server` access log, and canvas pixels as
+  `canvas.toDataURL('image/png')` POSTed (`mode: 'no-cors'`) to a tiny
+  BaseHTTPRequestHandler upload server on another port — capture inside a
+  `requestAnimationFrame` callback so the just-drawn buffer is read before
+  the non-preserved drawing buffer clears.

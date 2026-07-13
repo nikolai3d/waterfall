@@ -9,12 +9,6 @@ export const ROCKS = [
   [39.0, 3.5, 33.0, 4.0],
 ];
 
-// The scene is fixed in world units; geometry defined at the reference 64
-// grid scales with the actual grid resolution.
-export function scaleRocks(GRID) {
-  return ROCKS.map((r) => r.map((v) => (v * GRID) / 64));
-}
-
 // z-slice tiling of the 3D grid into a 2D texture. TILES² ≥ GRID; unused
 // tiles are never addressed (gridTexel only sees z < GRID).
 export function gridLayout(GRID) {
@@ -27,10 +21,6 @@ export function makeShaders(opts) {
   const { TILES, GTEX } = gridLayout(GRID);
   const s = GRID / 64;
   const vec3 = (a) => `vec3(${a.map((v) => v.toFixed(2)).join(', ')})`;
-
-  const rockInit = scaleRocks(GRID).map(
-    (r) => `vec4(${r.map((v) => v.toFixed(2)).join(', ')})`
-  ).join(',\n  ');
 
   const header = `#version 300 es
 precision highp float;
@@ -59,9 +49,7 @@ const vec3 EMIT_V = vec3(0.10, -0.05, 0.0);  // initial jet velocity
 const float PRADIUS = 0.021;     // particle render radius, world units
 
 const int NROCK = ${ROCKS.length};
-const vec4 ROCKS[NROCK] = vec4[NROCK](
-  ${rockInit}
-);
+uniform vec4 uRocks[NROCK]; // xyz center + radius, grid units (draggable)
 
 ivec2 gridTexel(ivec3 g) {
   return ivec2((g.z % TILES) * GRIDI + g.x, (g.z / TILES) * GRIDI + g.y);
@@ -81,7 +69,7 @@ void quadWeights(vec3 fx, out vec3 W[3]) {
 float sdRocks(vec3 p) {
   float d = 1e9;
   for (int i = 0; i < NROCK; i++) {
-    d = min(d, length(p - ROCKS[i].xyz) - ROCKS[i].w);
+    d = min(d, length(p - uRocks[i].xyz) - uRocks[i].w);
   }
   return d;
 }
@@ -90,8 +78,8 @@ vec3 rockNormal(vec3 p) {
   float best = 1e9;
   vec3 n = vec3(0.0, 1.0, 0.0);
   for (int i = 0; i < NROCK; i++) {
-    float d = length(p - ROCKS[i].xyz) - ROCKS[i].w;
-    if (d < best) { best = d; n = normalize(p - ROCKS[i].xyz); }
+    float d = length(p - uRocks[i].xyz) - uRocks[i].w;
+    if (d < best) { best = d; n = normalize(p - uRocks[i].xyz); }
   }
   return n;
 }
@@ -226,6 +214,7 @@ void main() {
   // conditions (free-slip walls and rocks).
   const fsGrid = header + `
 uniform sampler2D uGrid;
+uniform vec3 uRockVel[NROCK]; // grid units per substep; nonzero while dragged
 out vec4 o;
 
 void main() {
@@ -249,10 +238,17 @@ void main() {
   if (cell.z < 2 && v.z < 0.0) v.z = 0.0;
   if (cell.z > GRIDI - 3 && v.z > 0.0) v.z = 0.0;
 
-  float sd = sdRocks(vec3(cell));
-  if (sd < 0.5) {
-    vec3 n = rockNormal(vec3(cell));
-    float vn = dot(v, n);
+  // Rock BC relative to the nearest rock's velocity, so a dragged rock
+  // pushes water instead of letting it pass through.
+  float best = 1e9;
+  int ri = 0;
+  for (int i = 0; i < NROCK; i++) {
+    float d = length(vec3(cell) - uRocks[i].xyz) - uRocks[i].w;
+    if (d < best) { best = d; ri = i; }
+  }
+  if (best < 0.5) {
+    vec3 n = normalize(vec3(cell) - uRocks[ri].xyz);
+    float vn = dot(v - uRockVel[ri], n);
     if (vn < 0.0) v -= n * vn;
   }
   o = vec4(v, g.w);
@@ -610,10 +606,12 @@ void main() {
   // Analytic ray-sphere against the rocks, inside the cube only.
   float tR = 1e9;
   vec3 nrm = vec3(0.0);
+  vec3 rockC = vec3(0.0); // hit rock center, world units
+  float rockId = 0.0;
   bool isRock = false;
   for (int i = 0; i < NROCK; i++) {
-    vec3 c = ROCKS[i].xyz * (2.0 / GRIDF) - 1.0;
-    float r = ROCKS[i].w * (2.0 / GRIDF);
+    vec3 c = uRocks[i].xyz * (2.0 / GRIDF) - 1.0;
+    float r = uRocks[i].w * (2.0 / GRIDF);
     vec3 oc = uCamPos - c;
     float b = dot(oc, rd);
     float h = b * b - (dot(oc, oc) - r * r);
@@ -622,6 +620,8 @@ void main() {
       if (t > max(t0, 0.0) && t < min(tR, tE)) {
         tR = t;
         nrm = normalize(uCamPos + rd * t - c);
+        rockC = c;
+        rockId = float(i);
         isRock = true;
       }
     }
@@ -630,7 +630,10 @@ void main() {
   vec3 hit, col;
   if (isRock) {
     hit = uCamPos + rd * tR;
-    vec3 cell = floor(hit * 60.0);
+    // Noise in rock-local coordinates (offset per rock), so the texture is
+    // attached to the rock and moves with it when dragged, instead of the
+    // rock sliding through a fixed world-space noise volume.
+    vec3 cell = floor((hit - rockC) * 60.0 + rockId * 23.0);
     float n1 = hash1(cell);
     float n2 = hash1(cell + 17.0);
     float n3 = hash1(cell + 43.0);
@@ -671,9 +674,45 @@ void main() {
 }
 `;
 
+  // Drag gizmo: attribute-less wireframe delta indicator — a ghost circle
+  // at the drag origin, a line to the current center, and a circle there.
+  // 130 vertices as GL_LINES: ids 0-1 the line, then 2x32 segments.
+  const vsGizmo = header + `
+uniform mat4 uPV;
+uniform vec3 uA, uB;        // drag start / current rock center, world units
+uniform vec3 uCamR, uCamU;  // billboard basis
+uniform float uR;           // rock radius, world units
+flat out float vGhost;
+
+void main() {
+  vec3 p;
+  if (gl_VertexID < 2) {
+    p = gl_VertexID == 0 ? uA : uB;
+    vGhost = 0.0;
+  } else {
+    int seg = (gl_VertexID - 2) >> 1;
+    int circle = seg / 32;
+    float a = 6.2831853 * float(seg % 32 + ((gl_VertexID - 2) & 1)) / 32.0;
+    vec3 c = circle == 0 ? uA : uB;
+    p = c + (uCamR * cos(a) + uCamU * sin(a)) * uR;
+    vGhost = circle == 0 ? 1.0 : 0.0;
+  }
+  gl_Position = uPV * vec4(p, 1.0);
+}
+`;
+
+  const fsGizmo = header + `
+flat in float vGhost;
+out vec4 o;
+void main() {
+  o = vGhost > 0.5 ? vec4(0.55, 0.75, 0.95, 0.35) : vec4(0.80, 0.92, 1.0, 0.9);
+}
+`;
+
   return {
     vsQuad, vsP2G1, vsP2G2, fsScatter, fsDensity, fsGrid, fsG2P,
     vsPoint, fsPoint, fsBackground,
     fsPointDepth, vsThick, fsThick, fsBlur, fsComposite, fsBlit,
+    vsGizmo, fsGizmo,
   };
 }

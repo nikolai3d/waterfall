@@ -19,7 +19,8 @@ python3 -m http.server 8123
 # then open http://localhost:8123
 ```
 
-Controls: **drag** to orbit, **wheel** to zoom, **space** to pause,
+Controls: **drag a rock** to move it (the water is pushed aside as it goes),
+**drag** elsewhere to orbit, **wheel** to zoom, **space** to pause,
 **f** to toggle between the water surface and raw particle view. The panel
 in the top-right corner adjusts grid resolution (32³–128³) and particle
 count (128²–384²); changing either restarts the water in place (the camera
@@ -41,6 +42,8 @@ float textures and runs in shaders. Per substep:
    fused into grid momentum (eq. 16 of the MLS-MPM paper).
 4. **Grid update** — momentum → velocity, gravity, a CFL velocity clamp, and
    free-slip boundary conditions against the cube walls and the rock SDF.
+   Rock positions are uniforms, so rocks can be dragged live; a dragged
+   rock's velocity enters this boundary condition, shoving water aside.
 5. **G2P** — particles gather their new velocity and affine matrix from the
    grid and advect. Particles are recycled through the spout on a fixed
    lifetime, so the waterfall runs forever.

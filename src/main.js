@@ -7,7 +7,7 @@
 //   4. grid   momentum -> velocity, gravity, boundary conditions
 //   5. G2P    gather velocity + affine matrix, advect, spawn/recycle
 
-import { makeShaders, scaleRocks, gridLayout } from './shaders.js';
+import { makeShaders, ROCKS, gridLayout } from './shaders.js';
 
 const params = new URLSearchParams(location.search);
 const GRID_SIZES = [32, 64, 96, 128];
@@ -26,7 +26,20 @@ let SUBSTEPS = S_EXPLICIT ? parseInt(params.get('s'), 10) : defaultSubsteps();
 
 let N = PTEX * PTEX;
 let GTEX = gridLayout(GRID).GTEX;
-let rocks = scaleRocks(GRID);
+
+// Rocks: canonical state in world units ([-1,1] cube, xyz center + radius),
+// draggable at runtime; the ROCKS reference layout is defined at the 64 grid.
+// Grid-unit copies are derived for the shaders (uniforms) and pool seeding.
+const rocksW = ROCKS.map(([x, y, z, r]) => [x / 32 - 1, y / 32 - 1, z / 32 - 1, r / 32]);
+let rocks = []; // grid units, mirrors rocksW
+const rockData = new Float32Array(rocksW.length * 4); // uRocks upload
+const rockVel = new Float32Array(rocksW.length * 3);  // uRockVel, grid units/substep
+
+function updateRockData() {
+  rocks = rocksW.map(([x, y, z, r]) =>
+    [(x + 1) * GRID / 2, (y + 1) * GRID / 2, (z + 1) * GRID / 2, r * GRID / 2]);
+  for (let i = 0; i < rocks.length; i++) rockData.set(rocks[i], i * 4);
+}
 
 const canvas = document.getElementById('view');
 const statsEl = document.getElementById('stats');
@@ -138,7 +151,7 @@ gl.bindVertexArray(vao);
 // is torn down and rebuilt by initSim when the panel changes a parameter).
 
 let progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG, progPoints,
-  progPointDepth, progThick, progBlur, progComposite, progBlit;
+  progPointDepth, progThick, progBlur, progComposite, progBlit, progGizmo;
 let programs = [];
 let cur, nxt, gridA, gridB, gridAFBO, gridBFBO, densTex, densFBO;
 let substepCount = 0;
@@ -206,7 +219,7 @@ function initSim() {
 
   N = PTEX * PTEX;
   GTEX = gridLayout(GRID).GTEX;
-  rocks = scaleRocks(GRID);
+  updateRockData();
 
   const S = makeShaders({ GRID, PTEX, LIFE });
   progP2G1 = compile(S.vsP2G1, S.fsScatter, 'p2g1');
@@ -221,8 +234,10 @@ function initSim() {
   progBlur = compile(S.vsQuad, S.fsBlur, 'blur');
   progComposite = compile(S.vsQuad, S.fsComposite, 'composite');
   progBlit = compile(S.vsQuad, S.fsBlit, 'blit');
+  progGizmo = compile(S.vsGizmo, S.fsGizmo, 'gizmo');
   programs = [progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG,
-    progPoints, progPointDepth, progThick, progBlur, progComposite, progBlit];
+    progPoints, progPointDepth, progThick, progBlur, progComposite, progBlit,
+    progGizmo];
 
   const initData = initialParticleData();
   cur = makeParticleSet(initData);
@@ -274,6 +289,7 @@ function createTargets(w, h) {
 // Simulation step
 
 function substep() {
+  advanceRocks();
   gl.disable(gl.DEPTH_TEST);
 
   // 1. clear grid + P2G-1
@@ -319,6 +335,8 @@ function substep() {
   gl.viewport(0, 0, GTEX, GTEX);
   gl.useProgram(progGrid);
   bindTex(0, gridA, progGrid, 'uGrid');
+  gl.uniform4fv(u(progGrid, 'uRocks'), rockData);
+  gl.uniform3fv(u(progGrid, 'uRockVel'), rockVel);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   // 5. G2P + advect
@@ -327,6 +345,7 @@ function substep() {
   gl.useProgram(progG2P);
   bindTex(0, cur.pos, progG2P, 'uPos');
   bindTex(1, gridB, progG2P, 'uGrid');
+  gl.uniform4fv(u(progG2P, 'uRocks'), rockData);
   gl.uniform1f(u(progG2P, 'uFrame'), substepCount);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -392,10 +411,136 @@ const cam = { az: 0.7, el: 0.30, dist: 2.7, target: [0, -0.22, 0] };
 let dragging = false, lastX = 0, lastY = 0, lastInteraction = -1e9;
 let paused = false;
 
-canvas.addEventListener('mousedown', (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
-window.addEventListener('mouseup', () => { dragging = false; });
+function cameraBasis(w, h) {
+  const eye = [
+    cam.target[0] + cam.dist * Math.cos(cam.el) * Math.cos(cam.az),
+    cam.target[1] + cam.dist * Math.sin(cam.el),
+    cam.target[2] + cam.dist * Math.cos(cam.el) * Math.sin(cam.az),
+  ];
+  return { eye, aspect: w / h, ...lookAt(eye, cam.target, [0, 1, 0]) };
+}
+
+// World-space ray under the mouse (same construction as fsBackground).
+function mouseRay(e) {
+  const { eye, aspect, right, up, fwd } = cameraBasis(canvas.width, canvas.height);
+  const ux = (e.clientX / canvas.clientWidth) * 2 - 1;
+  const uy = 1 - (e.clientY / canvas.clientHeight) * 2;
+  const t = Math.tan(FOV / 2);
+  return {
+    ro: eye,
+    rd: normalize3([
+      fwd[0] + right[0] * ux * t * aspect + up[0] * uy * t,
+      fwd[1] + right[1] * ux * t * aspect + up[1] * uy * t,
+      fwd[2] + right[2] * ux * t * aspect + up[2] * uy * t,
+    ]),
+    fwd,
+  };
+}
+
+function pickRock(ro, rd) {
+  let idx = -1, tBest = 1e9;
+  for (let i = 0; i < rocksW.length; i++) {
+    const [cx, cy, cz, r] = rocksW[i];
+    const oc = [ro[0] - cx, ro[1] - cy, ro[2] - cz];
+    const b = oc[0] * rd[0] + oc[1] * rd[1] + oc[2] * rd[2];
+    const h = b * b - (oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - r * r);
+    if (h > 0) {
+      const t = -b - Math.sqrt(h);
+      if (t > 0 && t < tBest) { tBest = t; idx = i; }
+    }
+  }
+  return idx < 0 ? null : { i: idx, t: tBest };
+}
+
+// Drag state: the rock's target follows the mouse along the camera-aligned
+// plane through the grab point; the rock itself chases the target at a
+// capped speed in advanceRocks so the water can respond.
+let rockDrag = null; // { i, n: plane normal, p: grab point, off, target }
+
+const ROCK_SPEED = 0.5; // cells per substep (safely below the VMAX 0.85 clamp)
+
+function advanceRocks() {
+  rockVel.fill(0);
+  if (!rockDrag) return;
+  const c = rocksW[rockDrag.i];
+  const d = [rockDrag.target[0] - c[0], rockDrag.target[1] - c[1], rockDrag.target[2] - c[2]];
+  const len = Math.hypot(d[0], d[1], d[2]);
+  if (len < 1e-6) return;
+  const k = Math.min(len, ROCK_SPEED * 2 / GRID) / len;
+  for (let a = 0; a < 3; a++) {
+    c[a] += d[a] * k;
+    rockVel[rockDrag.i * 3 + a] = d[a] * k * GRID / 2; // world -> grid units
+  }
+  updateRockData();
+}
+
+canvas.addEventListener('mousedown', (e) => {
+  const { ro, rd, fwd } = mouseRay(e);
+  const hit = pickRock(ro, rd);
+  if (hit) {
+    const p = [ro[0] + rd[0] * hit.t, ro[1] + rd[1] * hit.t, ro[2] + rd[2] * hit.t];
+    const c = rocksW[hit.i];
+    rockDrag = {
+      i: hit.i, n: fwd, p,
+      off: [c[0] - p[0], c[1] - p[1], c[2] - p[2]],
+      target: [c[0], c[1], c[2]],
+      start: [c[0], c[1], c[2]], // gizmo anchor
+    };
+    dragEl.style.display = 'block';
+    moveDragEl(e);
+    lastInteraction = performance.now();
+  } else {
+    dragging = true; lastX = e.clientX; lastY = e.clientY;
+  }
+});
+window.addEventListener('mouseup', () => {
+  dragging = false; rockDrag = null; rockVel.fill(0);
+  dragEl.style.display = 'none';
+});
+
+// Floating delta readout that follows the cursor during a rock drag.
+const dragEl = document.getElementById('drag');
+
+function moveDragEl(e) {
+  dragEl.style.left = (e.clientX + 16) + 'px';
+  dragEl.style.top = (e.clientY + 16) + 'px';
+}
+
+function updateDragText() {
+  if (!rockDrag) return;
+  const c = rocksW[rockDrag.i], s = rockDrag.start;
+  const d = [c[0] - s[0], c[1] - s[1], c[2] - s[2]].map((v) => v * GRID / 2);
+  dragEl.textContent =
+    `Δ ${d.map((v) => v.toFixed(1)).join(', ')} · ${Math.hypot(...d).toFixed(1)} cells`;
+}
 window.addEventListener('mousemove', (e) => {
-  if (!dragging) return;
+  if (rockDrag) {
+    const { ro, rd } = mouseRay(e);
+    const n = rockDrag.n;
+    const denom = rd[0] * n[0] + rd[1] * n[1] + rd[2] * n[2];
+    if (Math.abs(denom) > 1e-6) {
+      const t = ((rockDrag.p[0] - ro[0]) * n[0] + (rockDrag.p[1] - ro[1]) * n[1] + (rockDrag.p[2] - ro[2]) * n[2]) / denom;
+      if (t > 0) {
+        // Keep the rock inside the walls; y may sink to center-at-floor
+        // (the initial rocks sit embedded in the floor).
+        const r = rocksW[rockDrag.i][3];
+        const B = 1 - 4 / GRID;
+        const m = Math.max(B - r, 0);
+        for (let a = 0; a < 3; a++) {
+          const w = ro[a] + rd[a] * t + rockDrag.off[a];
+          rockDrag.target[a] = a === 1 ? Math.min(m, Math.max(-B, w)) : Math.min(m, Math.max(-m, w));
+        }
+      }
+    }
+    moveDragEl(e);
+    lastInteraction = performance.now();
+    return;
+  }
+  if (!dragging) {
+    const { ro, rd } = mouseRay(e);
+    canvas.style.cursor = pickRock(ro, rd) ? 'move' : '';
+    return;
+  }
   cam.az += (e.clientX - lastX) * 0.005;
   cam.el = Math.min(1.35, Math.max(-0.15, cam.el + (e.clientY - lastY) * 0.005));
   lastX = e.clientX; lastY = e.clientY;
@@ -453,18 +598,30 @@ panel.addEventListener('click', (e) => {
 const FOV = 0.9;
 const LIGHT = normalize3([0.5, 0.8, 0.3]);
 
+// Wireframe drag gizmo overlay: ghost circle at the grab origin, line to
+// the current center, circle there. Drawn last, no depth test.
+function drawGizmo(pv, right, up) {
+  if (!rockDrag) return;
+  const c = rocksW[rockDrag.i];
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(progGizmo);
+  gl.uniformMatrix4fv(u(progGizmo, 'uPV'), false, pv);
+  gl.uniform3fv(u(progGizmo, 'uA'), rockDrag.start);
+  gl.uniform3f(u(progGizmo, 'uB'), c[0], c[1], c[2]);
+  gl.uniform3fv(u(progGizmo, 'uCamR'), right);
+  gl.uniform3fv(u(progGizmo, 'uCamU'), up);
+  gl.uniform1f(u(progGizmo, 'uR'), c[3]);
+  gl.drawArrays(gl.LINES, 0, 130);
+  gl.disable(gl.BLEND);
+}
+
 function render() {
   const w = canvas.width, h = canvas.height;
   if (!RT || RT.w !== w || RT.h !== h) createTargets(w, h);
 
-  const eye = [
-    cam.target[0] + cam.dist * Math.cos(cam.el) * Math.cos(cam.az),
-    cam.target[1] + cam.dist * Math.sin(cam.el),
-    cam.target[2] + cam.dist * Math.cos(cam.el) * Math.sin(cam.az),
-  ];
-  const aspect = w / h;
+  const { eye, aspect, view, right, up, fwd } = cameraBasis(w, h);
   const proj = perspective(FOV, aspect, 0.05, 20);
-  const { view, right, up, fwd } = lookAt(eye, cam.target, [0, 1, 0]);
   const pv = mul4(proj, view);
   const lightV = normalize3([
     view[0] * LIGHT[0] + view[4] * LIGHT[1] + view[8] * LIGHT[2],
@@ -490,6 +647,7 @@ function render() {
   gl.uniform1f(u(progBG, 'uAspect'), aspect);
   gl.uniformMatrix4fv(u(progBG, 'uPV'), false, pv);
   gl.uniform3fv(u(progBG, 'uLightW'), LIGHT);
+  gl.uniform4fv(u(progBG, 'uRocks'), rockData);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   if (renderMode === 'points') {
@@ -509,6 +667,7 @@ function render() {
     gl.useProgram(progBlit);
     bindTex(0, RT.sceneColor, progBlit, 'uScene');
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    drawGizmo(pv, right, up);
     return;
   }
 
@@ -569,6 +728,8 @@ function render() {
   gl.uniform1f(u(progComposite, 'uAspect'), aspect);
   gl.uniform3fv(u(progComposite, 'uLightV'), lightV);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  drawGizmo(pv, right, up);
 }
 
 // ---------------------------------------------------------------------------
@@ -610,8 +771,9 @@ function tick(now) {
   if (!paused) {
     for (let s = 0; s < SUBSTEPS; s++) substep();
     // Idle auto-orbit.
-    if (now - lastInteraction > 4000 && !dragging) cam.az += 0.0012;
+    if (now - lastInteraction > 4000 && !dragging && !rockDrag) cam.az += 0.0012;
   }
+  updateDragText();
   render();
 
   frames++;
