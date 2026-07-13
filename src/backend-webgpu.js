@@ -4,7 +4,8 @@
 // is fixed-point atomicAdd into a flat 3D grid storage buffer (no 27x point
 // amplification, no float-blend), particle state is SoA storage buffers
 // updated in place (no ping-pong MRT), and each substep is six dispatches
-// recorded in a single compute pass.
+// recorded in a single compute pass. Rendering is the same screen-space
+// fluid pipeline, with instanced quads standing in for point sprites.
 
 import { ROCKS } from './shaders.js';
 import { makeWGSL } from './wgsl.js';
@@ -41,17 +42,71 @@ export async function createBackend({ canvas, fail }) {
   }
 
   // -------------------------------------------------------------------------
+  // Config-independent resources: bind group layouts, samplers, uniforms.
+
+  const UNI = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+  const linSamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+  const bufRenderU = buf(448, UNI);
+  const bufBlurX = buf(16, UNI);
+  const bufBlurY = buf(16, UNI);
+
+  const simLayout = device.createBindGroupLayout({
+    entries: [
+      ...[0, 1, 2, 3, 4, 5].map((i) => ({
+        binding: i, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' },
+      })),
+      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ],
+  });
+  const renderLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+    ],
+  });
+  const blurLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+    ],
+  });
+  const compLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+    ],
+  });
+  const simPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
+  const renderPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [renderLayout] });
+  const blurPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [blurLayout] });
+  const compPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [compLayout] });
+
+  const alphaBlend = {
+    color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+  };
+  const addBlend = {
+    color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+    alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+  };
+  const depthState = { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' };
+
+  // -------------------------------------------------------------------------
   // Config-dependent state, rebuilt by init().
 
   let cfg = null;
   let NCELL = 0;
   let bufPos, bufVel, bufC, bufAux, bufGridA, bufGridV, bufSimU;
-  let simPipes = null; // { clear, p2g1, density, p2g2, grid, g2p }
+  let simPipes = null;
   let simBG = null;
-  let renderPipes = null; // { bg, points }
-  let bufRenderU, renderBGGroup;
+  let pipes = null;
+  let renderBGGroup = null;
   let substepCount = 0;
-  let allBuffers = [];
+  let simBuffers = [];
 
   // Sim uniform staging: rocks (16f) + rockVel (16f, vec3 padded) + frame.
   const simUData = new ArrayBuffer(144);
@@ -59,18 +114,19 @@ export async function createBackend({ canvas, fail }) {
   const simUU32 = new Uint32Array(simUData);
 
   // Render uniform staging (layout must match struct RenderU in wgsl.js).
-  const renderUData = new ArrayBuffer((16 * 3 + 4 * 9 + 4 * NROCK + 4 * 3) * 4);
+  const renderUData = new ArrayBuffer(448);
   const renderUF32 = new Float32Array(renderUData);
 
   function init(config) {
-    for (const b of allBuffers) b.destroy();
-    allBuffers = [];
+    for (const b of simBuffers) b.destroy();
     cfg = config;
     NCELL = cfg.GRID ** 3;
 
     const S = makeWGSL({ GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N });
     const simModule = device.createShaderModule({ code: S.sim });
     const renderModule = device.createShaderModule({ code: S.render });
+    const blurModule = device.createShaderModule({ code: S.blur });
+    const compModule = device.createShaderModule({ code: S.composite });
 
     const ST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     bufPos = buf(cfg.N * 16, ST | GPUBufferUsage.COPY_SRC, cfg.initialData);
@@ -79,20 +135,9 @@ export async function createBackend({ canvas, fail }) {
     bufAux = buf(cfg.N * 16, ST);
     bufGridA = buf(NCELL * 16, ST);
     bufGridV = buf(NCELL * 16, ST);
-    bufSimU = buf(144, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-    bufRenderU = buf(renderUData.byteLength, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
-    allBuffers = [bufPos, bufVel, bufC, bufAux, bufGridA, bufGridV, bufSimU, bufRenderU];
+    bufSimU = buf(144, UNI);
+    simBuffers = [bufPos, bufVel, bufC, bufAux, bufGridA, bufGridV, bufSimU];
 
-    // One bind group layout shared by all sim kernels.
-    const simLayout = device.createBindGroupLayout({
-      entries: [
-        ...[0, 1, 2, 3, 4, 5].map((i) => ({
-          binding: i, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' },
-        })),
-        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
-      ],
-    });
-    const simPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
     const cp = (entryPoint) => device.createComputePipeline({
       layout: simPipeLayout, compute: { module: simModule, entryPoint },
     });
@@ -113,34 +158,62 @@ export async function createBackend({ canvas, fail }) {
       ],
     });
 
-    // Render pipelines: raytraced background + instanced-quad impostors.
-    const renderLayout = device.createBindGroupLayout({
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-        { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
-        { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
-      ],
-    });
-    const renderPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [renderLayout] });
-    const depthState = {
-      format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less',
-    };
-    renderPipes = {
-      bg: device.createRenderPipeline({
-        layout: renderPipeLayout,
+    const rp = (desc) => device.createRenderPipeline({ layout: renderPipeLayout, ...desc });
+    pipes = {
+      bg: rp({
+        vertex: { module: renderModule, entryPoint: 'vsFull' },
+        fragment: { module: renderModule, entryPoint: 'fsBackground', targets: [{ format: 'rgba8unorm' }] },
+        primitive: { topology: 'triangle-list' },
+        depthStencil: depthState,
+      }),
+      bgCanvas: rp({
         vertex: { module: renderModule, entryPoint: 'vsFull' },
         fragment: { module: renderModule, entryPoint: 'fsBackground', targets: [{ format }] },
         primitive: { topology: 'triangle-list' },
         depthStencil: depthState,
       }),
-      points: device.createRenderPipeline({
-        layout: renderPipeLayout,
+      points: rp({
         vertex: { module: renderModule, entryPoint: 'vsPoints' },
         fragment: { module: renderModule, entryPoint: 'fsPoints', targets: [{ format }] },
         primitive: { topology: 'triangle-strip' },
         depthStencil: depthState,
       }),
+      pointDepth: rp({
+        vertex: { module: renderModule, entryPoint: 'vsPoints' },
+        fragment: { module: renderModule, entryPoint: 'fsPointDepth', targets: [{ format: 'r32float' }] },
+        primitive: { topology: 'triangle-strip' },
+        depthStencil: depthState,
+      }),
+      thick: rp({
+        vertex: { module: renderModule, entryPoint: 'vsThick' },
+        fragment: { module: renderModule, entryPoint: 'fsThick', targets: [{ format: 'rg16float', blend: addBlend }] },
+        primitive: { topology: 'triangle-strip' },
+      }),
+      gizmoDepth: rp({
+        vertex: { module: renderModule, entryPoint: 'vsGizmo' },
+        fragment: { module: renderModule, entryPoint: 'fsGizmo', targets: [{ format, blend: alphaBlend }] },
+        primitive: { topology: 'line-list' },
+        depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'always' },
+      }),
+      gizmo: rp({
+        vertex: { module: renderModule, entryPoint: 'vsGizmo' },
+        fragment: { module: renderModule, entryPoint: 'fsGizmo', targets: [{ format, blend: alphaBlend }] },
+        primitive: { topology: 'line-list' },
+      }),
+      blur: device.createRenderPipeline({
+        layout: blurPipeLayout,
+        vertex: { module: blurModule, entryPoint: 'vsFull' },
+        fragment: { module: blurModule, entryPoint: 'fsBlur', targets: [{ format: 'r32float' }] },
+        primitive: { topology: 'triangle-list' },
+      }),
+      composite: device.createRenderPipeline({
+        layout: compPipeLayout,
+        vertex: { module: compModule, entryPoint: 'vsFull' },
+        fragment: { module: compModule, entryPoint: 'fsComposite', targets: [{ format }] },
+        primitive: { topology: 'triangle-list' },
+      }),
     };
+
     renderBGGroup = device.createBindGroup({
       layout: renderLayout,
       entries: [
@@ -186,18 +259,56 @@ export async function createBackend({ canvas, fail }) {
   }
 
   // -------------------------------------------------------------------------
-  // Rendering
+  // Render targets (per canvas size) + their bind groups.
 
-  let depthTex = null, depthView = null, depthW = 0, depthH = 0;
+  let RT = null;
 
   function ensureTargets(w, h) {
-    if (depthTex && depthW === w && depthH === h) return;
-    if (depthTex) depthTex.destroy();
-    depthTex = device.createTexture({
-      size: [w, h], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    if (RT && RT.w === w && RT.h === h) return;
+    if (RT) for (const t of RT.textures) t.destroy();
+    const hw = Math.max(1, Math.ceil(w / 2));
+    const hh = Math.max(1, Math.ceil(h / 2));
+    const AT = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+    const tex = (fmt, tw, th, usage = AT) =>
+      device.createTexture({ size: [tw, th], format: fmt, usage });
+
+    const sceneColor = tex('rgba8unorm', w, h);
+    const sceneDepth = tex('depth24plus', w, h, GPUTextureUsage.RENDER_ATTACHMENT);
+    const waterDepth = tex('r32float', w, h);
+    const blurA = tex('r32float', w, h);
+    const blurB = tex('r32float', w, h);
+    const thick = tex('rg16float', hw, hh);
+
+    const v = {
+      sceneColor: sceneColor.createView(),
+      sceneDepth: sceneDepth.createView(),
+      waterDepth: waterDepth.createView(),
+      blurA: blurA.createView(),
+      blurB: blurB.createView(),
+      thick: thick.createView(),
+    };
+    const blurBG = (view, ubuf) => device.createBindGroup({
+      layout: blurLayout,
+      entries: [
+        { binding: 0, resource: { buffer: ubuf } },
+        { binding: 1, resource: view },
+      ],
     });
-    depthView = depthTex.createView();
-    depthW = w; depthH = h;
+    RT = {
+      w, h, v,
+      textures: [sceneColor, sceneDepth, waterDepth, blurA, blurB, thick],
+      blurBGs: [blurBG(v.waterDepth, bufBlurX), blurBG(v.blurA, bufBlurY), blurBG(v.blurB, bufBlurX)],
+      compBG: device.createBindGroup({
+        layout: compLayout,
+        entries: [
+          { binding: 0, resource: { buffer: bufRenderU } },
+          { binding: 1, resource: v.sceneColor },
+          { binding: 2, resource: linSamp },
+          { binding: 3, resource: v.blurB },
+          { binding: 4, resource: v.thick },
+        ],
+      }),
+    };
   }
 
   function writeRenderU(frame) {
@@ -222,24 +333,92 @@ export async function createBackend({ canvas, fail }) {
   function render(frame) {
     ensureTargets(frame.w, frame.h);
     writeRenderU(frame);
+    const scalePx = frame.h * frame.proj[5];
+    device.queue.writeBuffer(bufBlurX, 0, new Float32Array([1, 0, scalePx, 0]));
+    device.queue.writeBuffer(bufBlurY, 0, new Float32Array([0, 1, scalePx, 0]));
 
     const enc = device.createCommandEncoder();
-    const pass = enc.beginRenderPass({
-      colorAttachments: [{
-        view: context.getCurrentTexture().createView(),
-        loadOp: 'clear', storeOp: 'store',
-        clearValue: { r: 0.01, g: 0.015, b: 0.02, a: 1 },
-      }],
+    const canvasView = context.getCurrentTexture().createView();
+    const clearCol = { r: 0.01, g: 0.015, b: 0.02, a: 1 };
+
+    if (frame.mode === 'points') {
+      // Legacy view: background + shaded impostors straight to the canvas.
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: canvasView, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
+        depthStencilAttachment: {
+          view: RT.v.sceneDepth, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1,
+        },
+      });
+      pass.setBindGroup(0, renderBGGroup);
+      pass.setPipeline(pipes.bgCanvas);
+      pass.draw(3);
+      pass.setPipeline(pipes.points);
+      pass.draw(4, cfg.N);
+      if (frame.gizmo) { pass.setPipeline(pipes.gizmoDepth); pass.draw(130); }
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      return;
+    }
+
+    // 1. scene (cube walls + rocks) into offscreen color + depth
+    let pass = enc.beginRenderPass({
+      colorAttachments: [{ view: RT.v.sceneColor, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
       depthStencilAttachment: {
-        view: depthView, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1,
+        view: RT.v.sceneDepth, depthLoadOp: 'clear', depthStoreOp: 'store', depthClearValue: 1,
       },
     });
     pass.setBindGroup(0, renderBGGroup);
-    pass.setPipeline(renderPipes.bg);
+    pass.setPipeline(pipes.bg);
     pass.draw(3);
-    // SSF pipeline lands next; until then both modes render shaded impostors.
-    pass.setPipeline(renderPipes.points);
+    pass.end();
+
+    // 2. water surface depth (z-tested against the shared scene depth)
+    pass = enc.beginRenderPass({
+      colorAttachments: [{ view: RT.v.waterDepth, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }],
+      depthStencilAttachment: {
+        view: RT.v.sceneDepth, depthLoadOp: 'load', depthStoreOp: 'store',
+      },
+    });
+    pass.setBindGroup(0, renderBGGroup);
+    pass.setPipeline(pipes.pointDepth);
     pass.draw(4, cfg.N);
+    pass.end();
+
+    // 3. depth-aware separable blur, two iterations
+    for (const [outView, bg] of [
+      [RT.v.blurA, RT.blurBGs[0]], [RT.v.blurB, RT.blurBGs[1]],
+      [RT.v.blurA, RT.blurBGs[2]], [RT.v.blurB, RT.blurBGs[1]],
+    ]) {
+      pass = enc.beginRenderPass({
+        colorAttachments: [{ view: outView, loadOp: 'clear', storeOp: 'store' }],
+      });
+      pass.setPipeline(pipes.blur);
+      pass.setBindGroup(0, bg);
+      pass.draw(3);
+      pass.end();
+    }
+
+    // 4. thickness + foam, half resolution, additive
+    pass = enc.beginRenderPass({
+      colorAttachments: [{ view: RT.v.thick, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }],
+    });
+    pass.setBindGroup(0, renderBGGroup);
+    pass.setPipeline(pipes.thick);
+    pass.draw(4, cfg.N);
+    pass.end();
+
+    // 5. composite to the canvas (+ gizmo overlay)
+    pass = enc.beginRenderPass({
+      colorAttachments: [{ view: canvasView, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
+    });
+    pass.setPipeline(pipes.composite);
+    pass.setBindGroup(0, RT.compBG);
+    pass.draw(3);
+    if (frame.gizmo) {
+      pass.setPipeline(pipes.gizmo);
+      pass.setBindGroup(0, renderBGGroup);
+      pass.draw(130);
+    }
     pass.end();
     device.queue.submit([enc.finish()]);
   }
@@ -260,9 +439,9 @@ export async function createBackend({ canvas, fail }) {
   }
 
   function dispose() {
-    for (const b of allBuffers) b.destroy();
-    allBuffers = [];
-    if (depthTex) depthTex.destroy();
+    for (const b of simBuffers) b.destroy();
+    simBuffers = [];
+    if (RT) for (const t of RT.textures) t.destroy();
     device.destroy();
   }
 
