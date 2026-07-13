@@ -459,12 +459,28 @@ float dfetch(ivec2 t) {
 
 void main() {
   ivec2 tx = ivec2(gl_FragCoord.xy);
+  ivec2 dir = ivec2(uDir);
   float z0 = texelFetch(uDepth, tx, 0).r;
-  if (z0 <= 0.0) { o = vec4(0.0); return; }
+
+  // Gap fill (morphological closing): a pixel without water is filled when
+  // water lies on BOTH sides along this axis at a compatible depth, so
+  // nearby droplets merge into one surface instead of reading as separate
+  // spheres. One-sided support is rejected, so outer silhouettes never grow.
+  if (z0 <= 0.0) {
+    float zp = 0.0, zm = 0.0;
+    int ip = 0, im = 0;
+    for (int i = 1; i <= 20; i++) {
+      if (zp <= 0.0) { zp = dfetch(tx + dir * i); ip = i; }
+      if (zm <= 0.0) { zm = dfetch(tx - dir * i); im = i; }
+    }
+    if (zp <= 0.0 || zm <= 0.0 || abs(zp - zm) > NRANGE) { o = vec4(0.0); return; }
+    z0 = min(zp, zm);
+    float reach = clamp(0.045 * uScalePx / z0, 2.0, 20.0);
+    if (float(ip + im) > reach) { o = vec4(0.0); return; }
+  }
 
   float radius = clamp(0.045 * uScalePx / z0, 2.0, 20.0);
   float sum = z0, wsum = 1.0;
-  ivec2 dir = ivec2(uDir);
   for (int i = 1; i <= 20; i++) {
     float fi = float(i);
     if (fi > radius) break;
@@ -545,7 +561,11 @@ void main() {
 
   float foam = smoothstep(0.45, 0.9, speed);
   col = mix(col, vec3(0.93, 0.97, 1.0), foam * 0.75);
-  o = vec4(col, 1.0);
+
+  // Sparse water (lone droplets, spray) fades toward the scene instead of
+  // shading as a fully opaque sphere.
+  float cov = smoothstep(0.0, 0.09, th);
+  o = vec4(mix(scene, col, cov), 1.0);
 }
 `;
 

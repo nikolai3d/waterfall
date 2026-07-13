@@ -57,7 +57,10 @@ The water surface uses **screen-space fluid rendering** (van der Laan et al.,
 I3D 2009): sphere impostors write linear view-space depth to an offscreen
 target (z-tested against the raytraced scene depth), a depth-aware separable
 blur smooths it into a continuous surface, and an additive half-resolution
-pass accumulates thickness plus a speed-weighted foam channel. A composite
+pass accumulates thickness plus a speed-weighted foam channel. The blur also
+closes gaps between droplets at compatible depths (a morphological closing
+that never grows outer silhouettes), and the composite fades sparse water by
+thickness, so spray reads as translucent droplets rather than opaque spheres. A composite
 pass reconstructs normals from the smoothed depth and shades the surface:
 refraction of the scene, Beer–Lambert absorption by thickness, Fresnel,
 specular, and foam. Press **f** (or `?r=points`) for the raw shaded-particle
