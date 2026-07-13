@@ -12,6 +12,13 @@
 
 import { makeShaders, gridLayout } from './shaders.js';
 
+// Volume renderer offscreen scale (?rscale=, default 0.5 — the raymarch is
+// heavy at full resolution; the low-res target is load-bearing).
+function renderScale() {
+  const v = parseFloat(new URLSearchParams(location.search).get('rscale') || '0.5');
+  return v >= 0.1 && v <= 1 ? v : 0.5;
+}
+
 export async function createBackend({ canvas, fail }) {
   const gl = canvas.getContext('webgl2', { antialias: true, alpha: false, depth: true });
   if (!gl) fail('WebGL2 is not available in this browser.');
@@ -111,10 +118,13 @@ export async function createBackend({ canvas, fail }) {
   let cfg = null;
   let GTEX = 0;
   let progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG, progPoints,
-    progPointDepth, progThick, progBlur, progComposite, progBlit, progGizmo;
+    progPointDepth, progThick, progBlur, progComposite, progBlit, progGizmo,
+    progVolBlur, progVolume, progUpscale;
   let programs = [];
-  let cur, nxt, gridA, gridB, gridAFBO, gridBFBO, densTex, densFBO;
+  let cur, nxt, gridA, gridB, gridAFBO, gridBFBO, densTex, densFBO,
+    volDens, volDensFBO;
   let substepCount = 0;
+  const RSCALE = renderScale();
 
   function makeParticleSet(posData) {
     const pos = createTex(cfg.PTEX, cfg.PTEX, posData);
@@ -138,8 +148,8 @@ export async function createBackend({ canvas, fail }) {
     uniformCache.clear();
     deleteParticleSet(cur);
     deleteParticleSet(nxt);
-    for (const t of [gridA, gridB, densTex]) gl.deleteTexture(t);
-    for (const f of [gridAFBO, gridBFBO, densFBO]) gl.deleteFramebuffer(f);
+    for (const t of [gridA, gridB, densTex, volDens]) gl.deleteTexture(t);
+    for (const f of [gridAFBO, gridBFBO, densFBO, volDensFBO]) gl.deleteFramebuffer(f);
   }
 
   function init(config) {
@@ -161,9 +171,12 @@ export async function createBackend({ canvas, fail }) {
     progComposite = compile(S.vsQuad, S.fsComposite, 'composite');
     progBlit = compile(S.vsQuad, S.fsBlit, 'blit');
     progGizmo = compile(S.vsGizmo, S.fsGizmo, 'gizmo');
+    progVolBlur = compile(S.vsQuad, S.fsVolBlur, 'volBlur');
+    progVolume = compile(S.vsQuad, S.fsVolume, 'volume');
+    progUpscale = compile(S.vsQuad, S.fsUpscale, 'upscale');
     programs = [progP2G1, progP2G2, progDensity, progGrid, progG2P, progBG,
       progPoints, progPointDepth, progThick, progBlur, progComposite, progBlit,
-      progGizmo];
+      progGizmo, progVolBlur, progVolume, progUpscale];
 
     cur = makeParticleSet(cfg.initialData);
     nxt = makeParticleSet(cfg.initialData);
@@ -175,6 +188,11 @@ export async function createBackend({ canvas, fail }) {
 
     densTex = createTex(cfg.PTEX, cfg.PTEX);
     densFBO = createFBO([densTex]);
+
+    // Blurred (mass, |momentum|) grid for the volume renderer, tiled like
+    // the sim grid (half-float is plenty for mass ~0-30).
+    volDens = createTex(GTEX, GTEX, null, gl.RGBA16F);
+    volDensFBO = createFBO([volDens]);
 
     substepCount = 0;
   }
@@ -195,18 +213,22 @@ export async function createBackend({ canvas, fail }) {
     const blurA = createTex(w, h, null, gl.R32F);
     const blurB = createTex(w, h, null, gl.R32F);
     const thick = createTex(hw, hh, null, gl.RGBA16F, gl.LINEAR);
+    const volW = Math.max(1, Math.round(w * RSCALE));
+    const volH = Math.max(1, Math.round(h * RSCALE));
+    const volColor = createTex(volW, volH, null, gl.RGBA8, gl.LINEAR);
     RT = {
-      w, h, hw, hh,
-      sceneColor, waterDepth, blurA, blurB, thick,
+      w, h, hw, hh, volW, volH,
+      sceneColor, waterDepth, blurA, blurB, thick, volColor,
       sceneFBO: createFBO([sceneColor], depthTex),
       waterFBO: createFBO([waterDepth], depthTex), // shares the scene depth
       blurAFBO: createFBO([blurA]),
       blurBFBO: createFBO([blurB]),
       thickFBO: createFBO([thick]),
-      textures: [sceneColor, depthTex, waterDepth, blurA, blurB, thick],
+      volFBO: createFBO([volColor]),
+      textures: [sceneColor, depthTex, waterDepth, blurA, blurB, thick, volColor],
       fbos: [],
     };
-    RT.fbos = [RT.sceneFBO, RT.waterFBO, RT.blurAFBO, RT.blurBFBO, RT.thickFBO];
+    RT.fbos = [RT.sceneFBO, RT.waterFBO, RT.blurAFBO, RT.blurBFBO, RT.thickFBO, RT.volFBO];
   }
 
   // -------------------------------------------------------------------------
@@ -299,6 +321,41 @@ export async function createBackend({ canvas, fail }) {
   function render(frame) {
     const { w, h, proj, view, pv, aspect, lightV } = frame;
     if (!RT || RT.w !== w || RT.h !== h) createTargets(w, h);
+
+    if (frame.mode === 'volume') {
+      // Volumetric raymarch: box-blur the grid density, raymarch it into a
+      // scaled offscreen target, then upscale to the canvas.
+      gl.disable(gl.DEPTH_TEST);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, volDensFBO);
+      gl.viewport(0, 0, GTEX, GTEX);
+      gl.useProgram(progVolBlur);
+      bindTex(0, gridB, progVolBlur, 'uGrid');
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, RT.volFBO);
+      gl.viewport(0, 0, RT.volW, RT.volH);
+      gl.useProgram(progVolume);
+      bindTex(0, volDens, progVolume, 'uDens');
+      gl.uniform3fv(u(progVolume, 'uCamPos'), frame.eye);
+      gl.uniform3fv(u(progVolume, 'uCamR'), frame.right);
+      gl.uniform3fv(u(progVolume, 'uCamU'), frame.up);
+      gl.uniform3fv(u(progVolume, 'uCamF'), frame.fwd);
+      gl.uniform2f(u(progVolume, 'uRes'), RT.volW, RT.volH);
+      gl.uniform1f(u(progVolume, 'uTanF'), frame.tanF);
+      gl.uniform1f(u(progVolume, 'uAspect'), aspect);
+      gl.uniform3fv(u(progVolume, 'uLightW'), frame.lightW);
+      gl.uniform4fv(u(progVolume, 'uRocks'), cfg.rockData);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, w, h);
+      gl.useProgram(progUpscale);
+      bindTex(0, RT.volColor, progUpscale, 'uScene');
+      gl.uniform2f(u(progUpscale, 'uRes'), w, h);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      drawGizmo(frame);
+      return;
+    }
 
     // 1. scene (cube walls + rocks) into offscreen color + depth
     gl.bindFramebuffer(gl.FRAMEBUFFER, RT.sceneFBO);

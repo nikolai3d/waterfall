@@ -318,7 +318,7 @@ struct RenderU {
   lightW: vec4f,
   lightV: vec4f,
   res: vec4f,   // w, h, tanF, aspect
-  misc: vec4f,  // pointScale (h * proj[5]), halfH * proj[5], unused, unused
+  misc: vec4f,  // pointScale (h * proj[5]), halfH * proj[5], volume target w, h
   rocks: array<vec4f, ${NROCK}>, // grid units
   gizmo: array<vec4f, 3>,        // a.xyz + active, b.xyz + radius, unused
 };
@@ -773,10 +773,269 @@ fn fsComposite(@builtin(position) frag: vec4f) -> @location(0) vec4f {
 }
 `;
 
+  // --- Volumetric raymarcher (r=volume) ------------------------------------
+
+  // One-cell box blur of the sim grid's (velocity, mass) field into a small
+  // dedicated (mass, |momentum|) buffer: the raw per-substep mass is too
+  // speckly (4 particles/cell at rest) for a stable iso-surface.
+  const volBlur = common + `
+@group(0) @binding(0) var<storage, read> gridV: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> dens: array<vec2f>;
+
+@compute @workgroup_size(64)
+fn blurGrid(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (i >= NCELL) { return; }
+  let gi = i32(i);
+  let cell = vec3i(gi % GRIDI, (gi / GRIDI) % GRIDI, gi / (GRIDI * GRIDI));
+  // Tent weights (1,2,1)³ rather than a uniform box: thin sheets (the pool
+  // is ~1 cell deep at 128³) keep enough peak density to cross the iso.
+  var m = 0.0;
+  var s = 0.0;
+  for (var k = -1; k <= 1; k++) {
+    for (var j = -1; j <= 1; j++) {
+      for (var ii = -1; ii <= 1; ii++) {
+        let c = clamp(cell + vec3i(ii, j, k), vec3i(0), vec3i(GRIDI - 1));
+        let g = gridV[cellIndex(c)];
+        let w = f32((2 - abs(ii)) * (2 - abs(j)) * (2 - abs(k)));
+        m += w * g.w;
+        s += w * length(g.xyz) * g.w;
+      }
+    }
+  }
+  dens[i] = vec2f(m, s) * (1.0 / 64.0);
+}
+`;
+
+  // Fragment raymarch of the blurred density grid: iso-surface hit with
+  // bisection refine, gradient normal, one refraction segment with
+  // Beer-Lambert absorption from the marched interior density, and the
+  // analytic scene (walls + rocks) continued along the refracted ray.
+  // Renders into a scaled offscreen target (see misc.zw), upscaled after.
+  const volume = common + renderUStruct + `
+@group(0) @binding(0) var<uniform> R: RenderU;
+@group(0) @binding(1) var<storage, read> dens: array<vec2f>; // blurred (mass, |momentum|)
+
+const B: f32 = ${(1 - 4 / GRID).toFixed(6)};
+const ISO: f32 = 0.5;            // iso-surface threshold, particles/cell
+const STEP: f32 = ${(1 / GRID).toFixed(6)};  // 0.5 grid cells, world units
+const MAXIT: i32 = ${Math.ceil(3.5 * GRID)}; // covers the cube diagonal
+const STEP2: f32 = ${(2 / GRID).toFixed(6)}; // interior absorption step
+const MAXIT2: i32 = ${2 * GRID};
+const ABSORB: vec3f = vec3f(2.6, 1.0, 0.55);
+
+@vertex
+fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+  return vec4f(p * 2.0 - vec2f(1.0), 0.0, 1.0);
+}
+
+// Trilinear sample of the blurred (mass, |momentum|) grid at a world point.
+fn sampleD(p: vec3f) -> vec2f {
+  let g = clamp((p + vec3f(1.0)) * (GRIDF * 0.5), vec3f(0.0), vec3f(GRIDF - 1.001));
+  let b = vec3i(floor(g));
+  let f = g - floor(g);
+  let c00 = mix(dens[cellIndex(b)], dens[cellIndex(b + vec3i(1, 0, 0))], f.x);
+  let c10 = mix(dens[cellIndex(b + vec3i(0, 1, 0))], dens[cellIndex(b + vec3i(1, 1, 0))], f.x);
+  let c01 = mix(dens[cellIndex(b + vec3i(0, 0, 1))], dens[cellIndex(b + vec3i(1, 0, 1))], f.x);
+  let c11 = mix(dens[cellIndex(b + vec3i(0, 1, 1))], dens[cellIndex(b + vec3i(1, 1, 1))], f.x);
+  return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z);
+}
+
+fn density(p: vec3f) -> f32 { return sampleD(p).x; }
+
+fn gradD(p: vec3f) -> vec3f {
+  let h = 2.0 / GRIDF; // one cell
+  return vec3f(
+    density(p + vec3f(h, 0.0, 0.0)) - density(p - vec3f(h, 0.0, 0.0)),
+    density(p + vec3f(0.0, h, 0.0)) - density(p - vec3f(0.0, h, 0.0)),
+    density(p + vec3f(0.0, 0.0, h)) - density(p - vec3f(0.0, 0.0, h)));
+}
+
+// Analytic scene (walls + rocks) for a ray starting inside the cube:
+// trimmed copy of fsBackground. Returns rgb + hit distance.
+fn traceScene(ro: vec3f, rd: vec3f) -> vec4f {
+  let inv = 1.0 / rd;
+  let ta = (vec3f(-B) - ro) * inv;
+  let tb = (vec3f(B) - ro) * inv;
+  let tmax3 = max(ta, tb);
+  let tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+  var tHit = tE;
+  var nrm = vec3f(0.0);
+  var rockC = vec3f(0.0);
+  var rockId = 0.0;
+  var isRock = false;
+  for (var i = 0; i < NROCK; i++) {
+    let c = R.rocks[i].xyz * (2.0 / GRIDF) - vec3f(1.0);
+    let r = R.rocks[i].w * (2.0 / GRIDF);
+    let oc = ro - c;
+    let b = dot(oc, rd);
+    let h = b * b - (dot(oc, oc) - r * r);
+    if (h > 0.0) {
+      let t = -b - sqrt(h);
+      if (t > 1e-4 && t < tHit) {
+        tHit = t;
+        nrm = normalize(ro + rd * t - c);
+        rockC = c;
+        rockId = f32(i);
+        isRock = true;
+      }
+    }
+  }
+
+  let hit = ro + rd * tHit;
+  var col: vec3f;
+  if (isRock) {
+    let cell = floor((hit - rockC) * 60.0 + vec3f(rockId * 23.0));
+    let n1 = hash1(cell);
+    let n2 = hash1(cell + vec3f(17.0));
+    let n3 = hash1(cell + vec3f(43.0));
+    nrm = normalize(nrm + (vec3f(n1, n2, n3) - vec3f(0.5)) * 0.35);
+    let diff = max(dot(nrm, R.lightW.xyz), 0.0);
+    let ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
+    let base = mix(vec3f(0.30, 0.27, 0.24), vec3f(0.42, 0.40, 0.37), n1);
+    col = base * (0.30 + 0.75 * diff) * ao;
+  } else {
+    let a = abs(hit) / B;
+    var n: vec3f;
+    if (a.x > a.y && a.x > a.z) { n = vec3f(-sign(hit.x), 0.0, 0.0); }
+    else if (a.y > a.z) { n = vec3f(0.0, -sign(hit.y), 0.0); }
+    else { n = vec3f(0.0, 0.0, -sign(hit.z)); }
+    var base = vec3f(0.065, 0.075, 0.09);
+    if (n.y > 0.5) { base = vec3f(0.10, 0.11, 0.125); }
+    let diff = max(dot(n, R.lightW.xyz), 0.0);
+    col = base * (0.5 + 0.5 * diff);
+
+    var tuv: vec2f;
+    if (abs(n.x) > 0.5) { tuv = hit.yz; }
+    else if (abs(n.y) > 0.5) { tuv = hit.xz; }
+    else { tuv = hit.xy; }
+    let g2 = abs(fract(tuv * (GRIDF / 16.0)) - vec2f(0.5)) / (GRIDF / 16.0);
+    let line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
+    col *= mix(1.3, 1.0, line);
+
+    let sd = vec3f(B) - abs(hit);
+    let m1 = min(sd.x, min(sd.y, sd.z));
+    let mx = max(sd.x, max(sd.y, sd.z));
+    let mid = sd.x + sd.y + sd.z - m1 - mx;
+    col += vec3f(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+  }
+  return vec4f(col, tHit);
+}
+
+@fragment
+fn fsVolume(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+  var uv = frag.xy / R.misc.zw * 2.0 - vec2f(1.0);
+  uv.y = -uv.y; // framebuffer y is top-down in WebGPU
+  let rd = normalize(R.camF.xyz + R.camR.xyz * uv.x * R.res.z * R.res.w + R.camU.xyz * uv.y * R.res.z);
+  let ro = R.camPos.xyz;
+
+  let inv = 1.0 / rd;
+  let ta = (vec3f(-B) - ro) * inv;
+  let tb = (vec3f(B) - ro) * inv;
+  let tmin3 = min(ta, tb);
+  let tmax3 = max(ta, tb);
+  let t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
+  let tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+  if (tE < max(t0, 0.0)) { // missed the cube: dark backdrop
+    let g = 1.0 - length(uv) * 0.45;
+    return vec4f(vec3f(0.015, 0.02, 0.03) * g, 1.0);
+  }
+
+  // Analytic scene hit caps the march (water behind a rock stays behind it).
+  let tS = max(t0, 0.0);
+  let entry = ro + rd * tS;
+  let sc = traceScene(entry, rd);
+
+  var tHit = -1.0;
+  var t = STEP * hash1(vec3f(frag.xy, 0.0)); // dither to hide step banding
+  for (var i = 0; i < MAXIT; i++) {
+    t += STEP;
+    if (t > sc.w) { break; }
+    if (density(entry + rd * t) >= ISO) {
+      // Bisection refine between the last two samples.
+      var lo = t - STEP;
+      var hi = t;
+      for (var b = 0; b < 4; b++) {
+        let mid = 0.5 * (lo + hi);
+        if (density(entry + rd * mid) >= ISO) { hi = mid; } else { lo = mid; }
+      }
+      tHit = 0.5 * (lo + hi);
+      break;
+    }
+  }
+  if (tHit < 0.0) { return vec4f(sc.rgb, 1.0); }
+
+  let P = entry + rd * tHit;
+  var n = -normalize(gradD(P) + vec3f(1e-6));
+  if (dot(n, rd) > 0.0) { n = -n; }
+
+  // Refract; on total internal reflection fall back to reflection.
+  var rd2 = refract(rd, n, 0.752); // 1 / 1.33
+  if (dot(rd2, rd2) < 1e-6) { rd2 = reflect(rd, n); }
+  rd2 = normalize(rd2);
+
+  // Continue the analytic background along the refracted ray, integrating
+  // Beer-Lambert absorption from the marched interior density.
+  let sc2 = traceScene(P, rd2);
+  var th = 0.0;
+  for (var i = 0; i < MAXIT2; i++) {
+    let t2 = (f32(i) + 0.5) * STEP2;
+    if (t2 > sc2.w) { break; }
+    th += density(P + rd2 * t2) / REST * STEP2;
+  }
+  var col = sc2.rgb * exp(ABSORB * (-6.0 * th));
+  col += vec3f(0.04, 0.16, 0.24) * (1.0 - exp(-th * 12.0)); // in-scatter
+
+  let e = -rd;
+  let fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, e), 0.0), 5.0);
+  col = mix(col, vec3f(0.35, 0.50, 0.60), fres * 0.8);
+  let hv = normalize(R.lightW.xyz + e);
+  col += vec3f(0.9) * pow(max(dot(n, hv), 0.0), 120.0);
+
+  // Foam from the blurred momentum magnitude at the surface.
+  let sd = sampleD(P);
+  let speed = sd.y / max(sd.x, 1e-4) / VMAX;
+  let foam = smoothstep(0.45, 0.9, speed);
+  col = mix(col, vec3f(0.93, 0.97, 1.0), foam * 0.75);
+  return vec4f(col, 1.0);
+}
+`;
+
+  // Upscale blit of the scaled volume target to the canvas.
+  const volUpscale = `
+struct UpVSOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+};
+
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
+@group(0) @binding(1) var srcSamp: sampler;
+
+@vertex
+fn vsFull(@builtin(vertex_index) vi: u32) -> UpVSOut {
+  let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+  var o: UpVSOut;
+  o.pos = vec4f(p * 2.0 - vec2f(1.0), 0.0, 1.0);
+  o.uv = vec2f(p.x, 1.0 - p.y);
+  return o;
+}
+
+@fragment
+fn fsUpscale(v: UpVSOut) -> @location(0) vec4f {
+  return vec4f(textureSampleLevel(srcTex, srcSamp, v.uv, 0.0).rgb, 1.0);
+}
+`;
+
   return {
     sim,
     render: renderCommon + renderBG + renderPoints + renderSSF,
     blur,
     composite,
+    volBlur,
+    volume,
+    volUpscale,
   };
 }

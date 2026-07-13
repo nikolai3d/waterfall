@@ -699,6 +699,235 @@ void main() {
 }
 `;
 
+  // --- Volumetric raymarcher (r=volume) ---------------------------------
+
+  // One-cell box blur of the grid's (velocity, mass) field into a dedicated
+  // tiled (mass, |momentum|) texture: the raw per-substep mass is too
+  // speckly (4 particles/cell at rest) for a stable iso-surface.
+  const fsVolBlur = header + `
+uniform sampler2D uGrid;
+out vec4 o;
+
+void main() {
+  ivec2 tx = ivec2(gl_FragCoord.xy);
+  ivec2 tile = tx / GRIDI;
+  ivec2 loc = tx % GRIDI;
+  ivec3 cell = ivec3(loc.x, loc.y, tile.y * TILES + tile.x);
+  // Tent weights (1,2,1)³ rather than a uniform box: thin sheets (the pool
+  // is ~1 cell deep at 128³) keep enough peak density to cross the iso.
+  float m = 0.0;
+  float s = 0.0;
+  for (int k = -1; k <= 1; k++)
+  for (int j = -1; j <= 1; j++)
+  for (int i = -1; i <= 1; i++) {
+    ivec3 c = clamp(cell + ivec3(i, j, k), ivec3(0), ivec3(GRIDI - 1));
+    vec4 g = gridFetch(uGrid, c);
+    float w = float((2 - abs(i)) * (2 - abs(j)) * (2 - abs(k)));
+    m += w * g.w;
+    s += w * length(g.xyz) * g.w;
+  }
+  o = vec4(m, s, 0.0, 0.0) * (1.0 / 64.0);
+}
+`;
+
+  // Fragment raymarch of the blurred density grid: iso-surface hit with
+  // bisection refine, gradient normal, one refraction segment with
+  // Beer-Lambert absorption from the marched interior density, and the
+  // analytic scene (walls + rocks) continued along the refracted ray.
+  // Rendered into a scaled offscreen target and upscaled after.
+  const fsVolume = header + `
+uniform sampler2D uDens; // blurred (mass, |momentum|), tiled like the grid
+uniform vec3 uCamPos, uCamR, uCamU, uCamF;
+uniform vec2 uRes;       // scaled target size
+uniform float uTanF, uAspect;
+uniform vec3 uLightW;
+out vec4 o;
+
+const float B = ${(1 - 4 / GRID).toFixed(6)};
+const float ISO = 0.5;                        // iso threshold, particles/cell
+const float STEP = ${(1 / GRID).toFixed(6)};  // 0.5 grid cells, world units
+const int MAXIT = ${Math.ceil(3.5 * GRID)};   // covers the cube diagonal
+const float STEP2 = ${(2 / GRID).toFixed(6)}; // interior absorption step
+const int MAXIT2 = ${2 * GRID};
+const vec3 ABSORB = vec3(2.6, 1.0, 0.55);
+
+// Trilinear sample of the blurred (mass, |momentum|) grid at a world point
+// (per-slice fetches — the tiling breaks hardware filtering across z).
+vec2 sampleD(vec3 p) {
+  vec3 g = clamp((p + 1.0) * (GRIDF * 0.5), vec3(0.0), vec3(GRIDF - 1.001));
+  ivec3 b = ivec3(g);
+  vec3 f = g - vec3(b);
+  vec2 c00 = mix(gridFetch(uDens, b).xy, gridFetch(uDens, b + ivec3(1, 0, 0)).xy, f.x);
+  vec2 c10 = mix(gridFetch(uDens, b + ivec3(0, 1, 0)).xy, gridFetch(uDens, b + ivec3(1, 1, 0)).xy, f.x);
+  vec2 c01 = mix(gridFetch(uDens, b + ivec3(0, 0, 1)).xy, gridFetch(uDens, b + ivec3(1, 0, 1)).xy, f.x);
+  vec2 c11 = mix(gridFetch(uDens, b + ivec3(0, 1, 1)).xy, gridFetch(uDens, b + ivec3(1, 1, 1)).xy, f.x);
+  return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z);
+}
+
+float density(vec3 p) { return sampleD(p).x; }
+
+vec3 gradD(vec3 p) {
+  float h = 2.0 / GRIDF; // one cell
+  return vec3(
+    density(p + vec3(h, 0.0, 0.0)) - density(p - vec3(h, 0.0, 0.0)),
+    density(p + vec3(0.0, h, 0.0)) - density(p - vec3(0.0, h, 0.0)),
+    density(p + vec3(0.0, 0.0, h)) - density(p - vec3(0.0, 0.0, h)));
+}
+
+// Analytic scene (walls + rocks) for a ray starting inside the cube:
+// trimmed copy of fsBackground. Returns rgb + hit distance.
+vec4 traceScene(vec3 ro, vec3 rd) {
+  vec3 inv = 1.0 / rd;
+  vec3 ta = (vec3(-B) - ro) * inv;
+  vec3 tb = (vec3(B) - ro) * inv;
+  vec3 tmax3 = max(ta, tb);
+  float tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+  float tHit = tE;
+  vec3 nrm = vec3(0.0);
+  vec3 rockC = vec3(0.0);
+  float rockId = 0.0;
+  bool isRock = false;
+  for (int i = 0; i < NROCK; i++) {
+    vec3 c = uRocks[i].xyz * (2.0 / GRIDF) - 1.0;
+    float r = uRocks[i].w * (2.0 / GRIDF);
+    vec3 oc = ro - c;
+    float b = dot(oc, rd);
+    float h = b * b - (dot(oc, oc) - r * r);
+    if (h > 0.0) {
+      float t = -b - sqrt(h);
+      if (t > 1e-4 && t < tHit) {
+        tHit = t;
+        nrm = normalize(ro + rd * t - c);
+        rockC = c;
+        rockId = float(i);
+        isRock = true;
+      }
+    }
+  }
+
+  vec3 hit = ro + rd * tHit;
+  vec3 col;
+  if (isRock) {
+    vec3 cell = floor((hit - rockC) * 60.0 + rockId * 23.0);
+    float n1 = hash1(cell);
+    float n2 = hash1(cell + 17.0);
+    float n3 = hash1(cell + 43.0);
+    nrm = normalize(nrm + (vec3(n1, n2, n3) - 0.5) * 0.35);
+    float diff = max(dot(nrm, uLightW), 0.0);
+    float ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
+    vec3 base = mix(vec3(0.30, 0.27, 0.24), vec3(0.42, 0.40, 0.37), n1);
+    col = base * (0.30 + 0.75 * diff) * ao;
+  } else {
+    vec3 a = abs(hit) / B;
+    vec3 n;
+    if (a.x > a.y && a.x > a.z)      n = vec3(-sign(hit.x), 0.0, 0.0);
+    else if (a.y > a.z)              n = vec3(0.0, -sign(hit.y), 0.0);
+    else                             n = vec3(0.0, 0.0, -sign(hit.z));
+    vec3 base = n.y > 0.5 ? vec3(0.10, 0.11, 0.125) : vec3(0.065, 0.075, 0.09);
+    float diff = max(dot(n, uLightW), 0.0);
+    col = base * (0.5 + 0.5 * diff);
+
+    vec2 tuv = (abs(n.x) > 0.5) ? hit.yz : (abs(n.y) > 0.5 ? hit.xz : hit.xy);
+    vec2 g2 = abs(fract(tuv * (GRIDF / 16.0)) - 0.5) / (GRIDF / 16.0);
+    float line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
+    col *= mix(1.3, 1.0, line);
+
+    vec3 sd = vec3(B) - abs(hit);
+    float m1 = min(sd.x, min(sd.y, sd.z));
+    float mx = max(sd.x, max(sd.y, sd.z));
+    float mid = sd.x + sd.y + sd.z - m1 - mx;
+    col += vec3(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+  }
+  return vec4(col, tHit);
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy / uRes) * 2.0 - 1.0;
+  vec3 rd = normalize(uCamF + uCamR * uv.x * uTanF * uAspect + uCamU * uv.y * uTanF);
+  vec3 ro = uCamPos;
+
+  vec3 inv = 1.0 / rd;
+  vec3 ta = (vec3(-B) - ro) * inv;
+  vec3 tb = (vec3(B) - ro) * inv;
+  vec3 tmin3 = min(ta, tb);
+  vec3 tmax3 = max(ta, tb);
+  float t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
+  float tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+
+  if (tE < max(t0, 0.0)) { // missed the cube: dark backdrop
+    float g = 1.0 - length(uv) * 0.45;
+    o = vec4(vec3(0.015, 0.02, 0.03) * g, 1.0);
+    return;
+  }
+
+  // Analytic scene hit caps the march (water behind a rock stays behind it).
+  vec3 entry = ro + rd * max(t0, 0.0);
+  vec4 sc = traceScene(entry, rd);
+
+  float tHit = -1.0;
+  float t = STEP * hash1(vec3(gl_FragCoord.xy, 0.0)); // dither vs banding
+  for (int i = 0; i < MAXIT; i++) {
+    t += STEP;
+    if (t > sc.w) break;
+    if (density(entry + rd * t) >= ISO) {
+      // Bisection refine between the last two samples.
+      float lo = t - STEP;
+      float hi = t;
+      for (int b = 0; b < 4; b++) {
+        float mid = 0.5 * (lo + hi);
+        if (density(entry + rd * mid) >= ISO) hi = mid; else lo = mid;
+      }
+      tHit = 0.5 * (lo + hi);
+      break;
+    }
+  }
+  if (tHit < 0.0) { o = vec4(sc.rgb, 1.0); return; }
+
+  vec3 P = entry + rd * tHit;
+  vec3 n = -normalize(gradD(P) + 1e-6);
+  if (dot(n, rd) > 0.0) n = -n;
+
+  // Refract; on total internal reflection fall back to reflection.
+  vec3 rd2 = refract(rd, n, 0.752); // 1 / 1.33
+  if (dot(rd2, rd2) < 1e-6) rd2 = reflect(rd, n);
+  rd2 = normalize(rd2);
+
+  // Continue the analytic background along the refracted ray, integrating
+  // Beer-Lambert absorption from the marched interior density.
+  vec4 sc2 = traceScene(P, rd2);
+  float th = 0.0;
+  for (int i = 0; i < MAXIT2; i++) {
+    float t2 = (float(i) + 0.5) * STEP2;
+    if (t2 > sc2.w) break;
+    th += density(P + rd2 * t2) / REST * STEP2;
+  }
+  vec3 col = sc2.rgb * exp(ABSORB * (-6.0 * th));
+  col += vec3(0.04, 0.16, 0.24) * (1.0 - exp(-th * 12.0)); // in-scatter
+
+  vec3 e = -rd;
+  float fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, e), 0.0), 5.0);
+  col = mix(col, vec3(0.35, 0.50, 0.60), fres * 0.8);
+  vec3 hv = normalize(uLightW + e);
+  col += vec3(0.9) * pow(max(dot(n, hv), 0.0), 120.0);
+
+  // Foam from the blurred momentum magnitude at the surface.
+  vec2 sd = sampleD(P);
+  float speed = sd.y / max(sd.x, 1e-4) / VMAX;
+  float foam = smoothstep(0.45, 0.9, speed);
+  col = mix(col, vec3(0.93, 0.97, 1.0), foam * 0.75);
+  o = vec4(col, 1.0);
+}
+`;
+
+  // Upscale blit of the scaled volume target to the canvas.
+  const fsUpscale = header + `
+uniform sampler2D uScene; // linear-filtered scaled target
+uniform vec2 uRes;        // canvas size
+out vec4 o;
+void main() { o = vec4(texture(uScene, gl_FragCoord.xy / uRes).rgb, 1.0); }
+`;
+
   // Drag gizmo: attribute-less wireframe delta indicator — a ghost circle
   // at the drag origin, a line to the current center, and a circle there.
   // 130 vertices as GL_LINES: ids 0-1 the line, then 2x32 segments.
@@ -738,6 +967,7 @@ void main() {
     vsQuad, vsP2G1, vsP2G2, fsScatter, fsDensity, fsGrid, fsG2P,
     vsPoint, fsPoint, fsBackground,
     fsPointDepth, vsThick, fsThick, fsBlur, fsComposite, fsBlit,
+    fsVolBlur, fsVolume, fsUpscale,
     vsGizmo, fsGizmo,
   };
 }
