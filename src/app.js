@@ -413,6 +413,28 @@ const DEBUG = params.has('dbg');
 const WARM = parseInt(params.get('warm') || '0', 10);
 for (let i = 0; i < WARM; i++) step();
 
+// Benchmark mode: time ?bench=N frames after warmup, then freeze and report
+// (document.title is machine-readable via the DevTools /json endpoint).
+// Run Chrome with --disable-gpu-vsync --disable-frame-rate-limit so rAF
+// measures throughput, not the display refresh.
+const BENCH = parseInt(params.get('bench') || '0', 10);
+let benchFrames = 0, benchStart = 0, benchDone = false;
+
+function benchTick() {
+  if (!BENCH || benchDone) return;
+  if (benchFrames === 0) benchStart = performance.now();
+  benchFrames++;
+  if (benchFrames > BENCH) {
+    const ms = (performance.now() - benchStart) / BENCH;
+    benchDone = true;
+    paused = true;
+    const line = `bench ${backend.name} g=${GRID} p=${PTEX} s=${SUBSTEPS}: ` +
+      `${ms.toFixed(2)} ms/frame · ${(1000 / ms).toFixed(1)} fps`;
+    statsEl.textContent = line;
+    document.title = line;
+  }
+}
+
 async function debugDump() {
   const buf = await backend.readParticles(); // async on WebGPU (buffer map)
   let active = 0, sumY = 0, minY = 1e9, maxY = -1e9, midair = 0;
@@ -437,10 +459,11 @@ function tick(now) {
   }
   updateDragText();
   backend.render(frameState());
+  benchTick();
 
   frames++;
   if (DEBUG && frames % 5 === 0) debugDump();
-  if (now - lastFps > 500) {
+  if (!benchDone && now - lastFps > 500) {
     const fps = (frames * 1000) / (now - lastFps);
     statsEl.textContent =
       `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${renderMode} · ${backend.name}` +

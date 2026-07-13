@@ -1,7 +1,9 @@
 # waterfall
 
 A real-time 3D fluid simulation — a waterfall splashing onto rocks inside a
-cube — running entirely on the GPU in the browser via WebGL2.
+cube — running entirely on the GPU in the browser. Two backends share one
+app: **WebGPU** (compute shaders, used when available) and **WebGL2** (a
+fallback that emulates compute with render passes).
 
 ![screenshot](docs/screenshot.png)
 
@@ -28,13 +30,14 @@ survives).
 
 ## How it works
 
-Everything — particle state, the simulation grid, and all physics — lives in
-float textures and runs in shaders. Per substep:
+Everything — particle state, the simulation grid, and all physics — lives on
+the GPU. Per substep:
 
 1. **P2G pass 1** — each particle scatters mass and momentum (including its
-   affine velocity matrix *C*) to its 27 neighboring grid cells. Scatter is
-   done by rendering one GL point per (particle, cell) pair into a tiled 3D
-   grid texture with additive blending.
+   affine velocity matrix *C*) to its 27 neighboring grid cells. On WebGPU
+   this is a fixed-point `atomicAdd` into a 3D grid storage buffer; on
+   WebGL2 it is emulated by rendering one GL point per (particle, cell)
+   pair into a tiled grid texture with additive blending.
 2. **Density** — a fragment pass gathers grid mass back to each particle and
    evaluates a weakly compressible equation of state (no pressure solve
    needed — this is what makes MLS-MPM so friendly to GPUs).
@@ -48,11 +51,14 @@ float textures and runs in shaders. Per substep:
    grid and advect. Particles are recycled through the spout on a fixed
    lifetime, so the waterfall runs forever.
 
-The 3D grid is tiled slice-by-slice into a 2D texture (WebGL2 can't render
-into 3D textures per-slice with blending) — e.g. 64³ into 512×512, with the
-tiling derived per grid size. Rocks and walls are raytraced analytically
-in a fragment shader that writes real depth, so the water composites
-correctly against them.
+On WebGL2 the 3D grid is tiled slice-by-slice into a 2D texture (WebGL2
+can't render into 3D textures per-slice with blending) — e.g. 64³ into
+512×512, with the tiling derived per grid size — and particle state ping-
+pongs through float MRT textures; the WebGPU backend uses flat storage
+buffers updated in place. Rocks and walls are raytraced analytically in a
+fragment shader that writes real depth, so the water composites correctly
+against them. See `docs/perf-webgpu.md` for a measured comparison of the
+two backends.
 
 ### Rendering
 
@@ -81,14 +87,16 @@ visible — visually minor.
 | `l`    | 2600       | particle lifetime in substeps (spout recycling)    |
 | `warm` | 0          | substeps to pre-simulate before the first frame    |
 | `r`    | `ssf`      | rendering: `ssf` (water surface) or `points`       |
+| `api`  | auto       | backend: `webgpu` or `webgl2` (auto-detects)       |
+| `bench`| off        | time N frames after warmup, then freeze + report   |
 | `dbg`  | off        | overlay with GPU-readback particle statistics      |
 
 Example: [`?p=128&s=3`](http://localhost:8123/?p=128&s=3) for slower machines.
 
 ## Requirements
 
-WebGL2 with `EXT_color_buffer_float` and `EXT_float_blend` (available in all
-current desktop browsers).
+WebGPU where available; otherwise WebGL2 with `EXT_color_buffer_float` and
+`EXT_float_blend` (available in all current desktop browsers).
 
 ## License
 
