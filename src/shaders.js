@@ -442,10 +442,13 @@ void main() {
   ivec2 s = textureSize(uFront, 0);
   ivec2 px = clamp(ivec2(gl_FragCoord.xy * 2.0), ivec2(0), s - 1);
   float front = texelFetch(uFront, px, 0).r;
-  if (front > 0.0 && vZ > front + 0.3) discard;
+  // Occluded water keeps coverage (B) but contributes no foam/absorption
+  // (R, G) — culling it entirely would fade the composite to the
+  // background wherever the near water is sparse (fake holes).
+  float keep = (front > 0.0 && vZ > front + 0.3) ? 0.0 : 1.0;
   float f = 1.0 - r2;
   float th = f * f * PRADIUS * 2.0;
-  o = vec4(th, th * vSpeed, 0.0, 1.0);
+  o = vec4(th * keep, th * vSpeed * keep, th, 1.0);
 }
 `;
 
@@ -488,33 +491,24 @@ void main() {
     if (float(ip + im) > reach) { o = vec4(0.0); return; }
   }
 
-  // Narrow-range filter with lower-bound clamping (Truong & Yuksel, i3D
-  // 2018): instead of rejecting neighbors from a different surface, clamp
-  // samples toward the nearest depth in the window. Where the stream
-  // crosses in front of the pool, the near surface wins and reconstructs
-  // as one continuous sheet instead of being eaten by the far surface.
+  // Narrow-range filter (Truong & Yuksel, i3D 2018): instead of rejecting
+  // neighbors from a different surface, clamp them to the center's depth
+  // band, anchored on the CENTER (not the window minimum — that propagates
+  // isolated droplets as square halos through the separable passes). Near
+  // neighbors pull the surface at most NRANGE nearer per pass; across the
+  // four iterated passes a real near sheet wins over the pool behind it.
   float radius = clamp(0.045 * uScalePx / z0, 2.0, 20.0);
-  float sa[20];
-  float sb[20];
-  int n = 0;
-  float zmin = z0;
+  float lo = z0 - NRANGE;
+  float hi = z0 + NRANGE;
+  float sum = z0, wsum = 1.0;
   for (int i = 1; i <= 20; i++) {
-    if (float(i) > radius) break;
+    float fi = float(i);
+    if (fi > radius) break;
+    float g = exp(-fi * fi / (0.5 * radius * radius));
     float za = dfetch(tx + dir * i);
     float zb = dfetch(tx - dir * i);
-    sa[i - 1] = za;
-    sb[i - 1] = zb;
-    n = i;
-    if (za > 0.0) zmin = min(zmin, za);
-    if (zb > 0.0) zmin = min(zmin, zb);
-  }
-  float hi = zmin + NRANGE;
-  float sum = min(z0, hi), wsum = 1.0;
-  for (int i = 1; i <= n; i++) {
-    float fi = float(i);
-    float g = exp(-fi * fi / (0.5 * radius * radius));
-    if (sa[i - 1] > 0.0) { sum += min(sa[i - 1], hi) * g; wsum += g; }
-    if (sb[i - 1] > 0.0) { sum += min(sb[i - 1], hi) * g; wsum += g; }
+    if (za > 0.0) { sum += clamp(za, lo, hi) * g; wsum += g; }
+    if (zb > 0.0) { sum += clamp(zb, lo, hi) * g; wsum += g; }
   }
   o = vec4(sum / wsum, 0.0, 0.0, 1.0);
 }
@@ -567,8 +561,8 @@ void main() {
   vec3 n = normalize(cross(dx, dy));
   if (n.z < 0.0) n = -n;
 
-  vec2 t2 = texture(uThick, tuv).rg;
-  float th = t2.r * 3.0;
+  vec3 t2 = texture(uThick, tuv).rgb;
+  float th = t2.r * 3.0;             // near-surface water only
   float speed = t2.g / max(t2.r, 1e-4);
 
   // Refract the background through the surface.
@@ -589,8 +583,9 @@ void main() {
   col = mix(col, vec3(0.93, 0.97, 1.0), foam * 0.75);
 
   // Sparse water (lone droplets, spray) fades toward the scene instead of
-  // shading as a fully opaque sphere.
-  float cov = smoothstep(0.0, 0.09, th);
+  // shading as a fully opaque sphere. Coverage uses TOTAL thickness (B),
+  // so water occluded from foam/absorption still keeps the pixel wet.
+  float cov = smoothstep(0.0, 0.09, t2.b * 3.0);
   o = vec4(mix(scene, col, cov), 1.0);
 }
 `;

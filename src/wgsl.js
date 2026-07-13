@@ -565,10 +565,14 @@ fn fsThick(v: PointVSOut) -> @location(0) vec4f {
   let s = vec2i(textureDimensions(frontTex));
   let px = clamp(vec2i(v.pos.xy * 2.0), vec2i(0), s - vec2i(1));
   let front = textureLoad(frontTex, px, 0).r;
-  if (front > 0.0 && v.viewZ > front + 0.3) { discard; }
+  // Occluded water keeps coverage (B) but contributes no foam/absorption
+  // (R, G) — culling it entirely would fade the composite to the
+  // background wherever the near water is sparse (fake holes).
+  var keep = 1.0;
+  if (front > 0.0 && v.viewZ > front + 0.3) { keep = 0.0; }
   let f = 1.0 - r2;
   let th = f * f * PRADIUS * 2.0;
-  return vec4f(th, th * v.speed, 0.0, 1.0);
+  return vec4f(th * keep, th * v.speed * keep, th, 1.0);
 }
 
 // Drag gizmo: attribute-less wireframe delta indicator (line + billboard
@@ -658,32 +662,24 @@ fn fsBlur(@builtin(position) frag: vec4f) -> @location(0) vec4f {
     if (f32(ip + im) > reach) { return vec4f(0.0); }
   }
 
-  // Narrow-range filter with lower-bound clamping (Truong & Yuksel, i3D
-  // 2018): clamp samples toward the nearest depth in the window instead of
-  // rejecting them, so the near surface wins where surfaces overlap.
+  // Narrow-range filter (Truong & Yuksel, i3D 2018): clamp neighbors to the
+  // center's depth band, anchored on the CENTER (not the window minimum —
+  // that propagates isolated droplets as square halos through the separable
+  // passes). Near neighbors pull the surface at most NRANGE nearer per
+  // pass; across the four iterated passes a real near sheet wins.
   let radius = clamp(0.045 * BU.scalePx / z0, 2.0, 20.0);
-  var sa: array<f32, 20>;
-  var sb: array<f32, 20>;
-  var n = 0;
-  var zmin = z0;
+  let lo = z0 - NRANGE;
+  let hi = z0 + NRANGE;
+  var sum = z0;
+  var wsum = 1.0;
   for (var i = 1; i <= 20; i++) {
-    if (f32(i) > radius) { break; }
+    let fi = f32(i);
+    if (fi > radius) { break; }
+    let g = exp(-fi * fi / (0.5 * radius * radius));
     let za = dfetch(tx + dir * i);
     let zb = dfetch(tx - dir * i);
-    sa[i - 1] = za;
-    sb[i - 1] = zb;
-    n = i;
-    if (za > 0.0) { zmin = min(zmin, za); }
-    if (zb > 0.0) { zmin = min(zmin, zb); }
-  }
-  let hi = zmin + NRANGE;
-  var sum = min(z0, hi);
-  var wsum = 1.0;
-  for (var i = 1; i <= n; i++) {
-    let fi = f32(i);
-    let g = exp(-fi * fi / (0.5 * radius * radius));
-    if (sa[i - 1] > 0.0) { sum += min(sa[i - 1], hi) * g; wsum += g; }
-    if (sb[i - 1] > 0.0) { sum += min(sb[i - 1], hi) * g; wsum += g; }
+    if (za > 0.0) { sum += clamp(za, lo, hi) * g; wsum += g; }
+    if (zb > 0.0) { sum += clamp(zb, lo, hi) * g; wsum += g; }
   }
   return vec4f(sum / wsum, 0.0, 0.0, 1.0);
 }
@@ -747,8 +743,8 @@ fn fsComposite(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   var n = normalize(cross(dx, dy));
   if (n.z < 0.0) { n = -n; }
 
-  let t2 = textureSampleLevel(thickTex, linSamp, tuv, 0.0).rg;
-  let th = t2.r * 3.0;
+  let t2 = textureSampleLevel(thickTex, linSamp, tuv, 0.0).rgb;
+  let th = t2.r * 3.0;             // near-surface water only
   let speed = t2.g / max(t2.r, 1e-4);
 
   // Refract the background through the surface (y flipped: texture space
@@ -770,8 +766,9 @@ fn fsComposite(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   col = mix(col, vec3f(0.93, 0.97, 1.0), foam * 0.75);
 
   // Sparse water (lone droplets, spray) fades toward the scene instead of
-  // shading as a fully opaque sphere.
-  let cov = smoothstep(0.0, 0.09, th);
+  // shading as a fully opaque sphere. Coverage uses TOTAL thickness (B),
+  // so water occluded from foam/absorption still keeps the pixel wet.
+  let cov = smoothstep(0.0, 0.09, t2.b * 3.0);
   return vec4f(mix(scene, col, cov), 1.0);
 }
 `;
