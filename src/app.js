@@ -10,10 +10,10 @@ import { ROCKS } from './shaders.js';
 const params = new URLSearchParams(location.search);
 const GRID_SIZES = [32, 64, 96, 128];
 
-let GRID = parseInt(params.get('g') || '128', 10);
-if (!GRID_SIZES.includes(GRID)) GRID = 128;
-let PTEX = parseInt(params.get('p') || '512', 10);
-if (!(PTEX >= 4 && PTEX <= 2048)) PTEX = 512;
+let GRID = parseInt(params.get('g') || '96', 10);
+if (!GRID_SIZES.includes(GRID)) GRID = 96;
+let PTEX = parseInt(params.get('p') || '384', 10);
+if (!(PTEX >= 4 && PTEX <= 2048)) PTEX = 384;
 const LIFE = parseInt(params.get('l') || '2600', 10);
 
 // The CFL clamp caps velocity in cells/substep, so finer grids need more
