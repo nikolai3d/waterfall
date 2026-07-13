@@ -37,7 +37,21 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
 - `?r=mesh` is the marching-cubes isosurface mesh — WebGPU only: on WebGL2
   the chip stays enabled but the mode renders the `ssf` path (console note,
   no error overlay), so a `?api=webgl2&r=mesh` shot must look like `r=ssf`.
-- Evidence for WebGPU-only modes (`r=mesh`) must pin `?api=webgpu` AND
+- `?r=trace` is the progressive path tracer — WebGPU only, same fallback
+  contract as mesh (`trace→ssf` on WebGL2). Selecting it (URL or chip)
+  auto-pauses the sim; the stats line reads
+  `… trace rscale=0.5 spp=N · webgpu · paused`, where `spp=` counts
+  accumulated samples (frames since the last accumulation reset × `?spp=`,
+  which is 1–8 paths/pixel/frame; `?bounces=` 1–8 is max path depth — both
+  baked at init, garbage falls back to defaults). The accumulation resets
+  on camera orbit, rock drag, sim steps, and panel changes — assert `spp=`
+  dropping to a small value to prove a reset, or growing large to prove
+  convergence. "Let it cook" needs REAL time: under virtual time only a
+  handful of frames accumulate, so converged shots come from a real-time
+  harness run. Gotcha shared by all grid-density renderers
+  (volume/voxel/mesh/trace): after a grid/particles chip change while
+  paused, there is no water until the sim advances (fresh grid is empty).
+- Evidence for WebGPU-only modes (`r=mesh`, `r=trace`) must pin `?api=webgpu` AND
   stats-assert BOTH the mode token and the backend name. Two markers make a
   silent fallback impossible to mistake for the real thing: when the auto
   backend selection falls back (webgpu import failed, `api` not pinned) the
@@ -50,10 +64,10 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
   (same blur/thickness/composite pipeline); its elongation gain is `?k=`
   (default 1.5, valid 0–4; garbage or out-of-range falls back to the
   default, and `?k=0` looks like `r=ssf`).
-- The stats line shows the active render mode (and, in volume/voxel modes,
-  the effective `rscale=`; in voxel and mesh modes also `iso=`; in aniso
-  mode `k=`) — assert on it in harnesses to confirm a mode/param took
-  effect.
+- The stats line shows the active render mode (and, in volume/voxel/trace
+  modes, the effective `rscale=`; in voxel and mesh modes also `iso=`; in
+  aniso mode `k=`; in trace mode the accumulated `spp=`) — assert on it in
+  harnesses to confirm a mode/param took effect.
 - macOS has no `timeout` command.
 
 ## Driving the UI (clicks) headlessly

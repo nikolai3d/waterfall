@@ -9,7 +9,8 @@ import { ROCKS, THICK_MUL, ANISO_AGE } from './shaders.js';
 import { MC_ROW, MC_CAP, MC_CORNERS, MC_EDGES } from './mctables.js';
 
 export function makeWGSL(opts) {
-  const { GRID, LIFE, N, ISO, K } = opts; // ISO/K validated/defaulted in app.js
+  // ISO/K/SPP/BOUNCES are validated/defaulted in app.js.
+  const { GRID, LIFE, N, ISO, K, SPP = 1, BOUNCES = 4 } = opts;
   const s = GRID / 64;
   const vec3f = (a) => `vec3f(${a.map((v) => v.toFixed(2)).join(', ')})`;
   const NROCK = ROCKS.length;
@@ -1487,6 +1488,358 @@ fn fsMesh(v: MeshVSOut) -> @location(0) vec4f {
 }
 `;
 
+  // --- Progressive path tracer (r=trace, WebGPU only) -----------------------
+
+  // Fullscreen fragment kernel: SPP jittered paths per pixel per frame,
+  // running-averaged into a ping-ponged rgba32float accumulation target
+  // (weight 1/frame; the app restarts the counter whenever the camera, rocks,
+  // sim state, canvas size, or config change). The scene is the same analytic
+  // cube + rock spheres; the water is the volume renderer's tent-blurred
+  // density grid at iso 0.5 (coarse march + bisection, as fsVolume).
+  //
+  // Pragmatic light model for a closed cube: the directional light shines
+  // through the walls (only rocks and water block shadow rays — water
+  // attenuates Beer-Lambert, giving colored water shadows and caustic-ish
+  // pools of light on the floor), plus a small constant ambient at every
+  // surface event. Wall/rock albedos are shadeRock/shadeWall with the
+  // lighting factored out (duplicated here rather than refactoring the
+  // shared shading, so the other renderers stay pixel-identical); the wall
+  // edge glow becomes emission. Water events split reflect/refract by
+  // Schlick-Fresnel russian roulette; interior scattering is absorption-only
+  // (issue #10 v1). Diffuse bounces are cosine-weighted; russian-roulette
+  // termination kicks in after bounce 2.
+  const trace = common + renderUStruct + `
+struct TraceU {
+  frame: u32, // frames accumulated so far, 1-based (1 = restart)
+  _p0: u32, _p1: u32, _p2: u32,
+};
+
+@group(0) @binding(0) var<uniform> R: RenderU;
+@group(0) @binding(1) var<storage, read> dens: array<vec2f>; // blurred (mass, |momentum|)
+@group(0) @binding(2) var prevAcc: texture_2d<f32>;
+@group(0) @binding(3) var<uniform> TU: TraceU;
+
+const SPP: i32 = ${SPP};       // paths per pixel per frame (?spp=)
+const MAXB: i32 = ${BOUNCES};  // max path bounces (?bounces=)
+const TISO: f32 = 0.5;         // water iso threshold (matches r=volume)
+const STEP: f32 = ${(1 / GRID).toFixed(6)};  // surface-march step (0.5 cells)
+const MAXIT: i32 = ${Math.ceil(3.5 * GRID)}; // covers the cube diagonal
+const STEP2: f32 = ${(2 / GRID).toFixed(6)}; // interior/shadow step (1 cell)
+const MAXIT2: i32 = ${2 * GRID};
+const LIGHTCOL: vec3f = vec3f(1.05, 1.00, 0.92);
+const AMBIENT: vec3f = vec3f(0.14, 0.16, 0.20); // dim sky stand-in
+const EPS: f32 = 1e-3;
+
+@vertex
+fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+  return vec4f(p * 2.0 - vec2f(1.0), 0.0, 1.0);
+}
+` + densSample + `
+fn gradD(p: vec3f) -> vec3f {
+  let h = 2.0 / GRIDF; // one cell
+  return vec3f(
+    density(p + vec3f(h, 0.0, 0.0)) - density(p - vec3f(h, 0.0, 0.0)),
+    density(p + vec3f(0.0, h, 0.0)) - density(p - vec3f(0.0, h, 0.0)),
+    density(p + vec3f(0.0, 0.0, h)) - density(p - vec3f(0.0, 0.0, h)));
+}
+
+// PCG-style stateful RNG, seeded per pixel/frame in fsTrace.
+var<private> rngState: u32;
+
+fn rand() -> f32 {
+  rngState = rngState * 747796405u + 2891336453u;
+  var w = ((rngState >> ((rngState >> 28u) + 4u)) ^ rngState) * 277803737u;
+  w = (w >> 22u) ^ w;
+  return f32(w) * (1.0 / 4294967296.0);
+}
+
+fn fresnelS(c: f32) -> f32 {
+  return 0.02 + 0.98 * pow(1.0 - clamp(c, 0.0, 1.0), 5.0);
+}
+
+fn cosineDir(n: vec3f) -> vec3f {
+  let a = 6.2831853 * rand();
+  let r2 = rand();
+  let r = sqrt(r2);
+  var refv = vec3f(0.0, 1.0, 0.0);
+  if (abs(n.y) > 0.9) { refv = vec3f(1.0, 0.0, 0.0); }
+  let t1 = normalize(cross(refv, n));
+  let t2 = cross(n, t1);
+  return normalize(t1 * (r * cos(a)) + t2 * (r * sin(a)) + n * sqrt(max(1.0 - r2, 0.0)));
+}
+
+struct SceneH {
+  t: f32,
+  n: vec3f,
+  alb: vec3f,
+  emit: vec3f,
+};
+
+// Nearest wall/rock hit for a ray inside the cube: geometry as traceScene,
+// but returning normal + albedo + emission instead of a shaded color.
+fn intersectScene(ro: vec3f, rd: vec3f) -> SceneH {
+  var h: SceneH;
+  let inv = 1.0 / rd;
+  let ta = (vec3f(-B) - ro) * inv;
+  let tb = (vec3f(B) - ro) * inv;
+  let tmax3 = max(ta, tb);
+  h.t = max(min(min(tmax3.x, tmax3.y), tmax3.z), EPS);
+
+  // Wall: shadeWall's base + grid lines as albedo, edge glow as emission.
+  let hp = ro + rd * h.t;
+  let a = abs(hp) / B;
+  var n: vec3f;
+  if (a.x > a.y && a.x > a.z) { n = vec3f(-sign(hp.x), 0.0, 0.0); }
+  else if (a.y > a.z) { n = vec3f(0.0, -sign(hp.y), 0.0); }
+  else { n = vec3f(0.0, 0.0, -sign(hp.z)); }
+  var base = vec3f(0.065, 0.075, 0.09);
+  if (n.y > 0.5) { base = vec3f(0.10, 0.11, 0.125); }
+  var tuv: vec2f;
+  if (abs(n.x) > 0.5) { tuv = hp.yz; }
+  else if (abs(n.y) > 0.5) { tuv = hp.xz; }
+  else { tuv = hp.xy; }
+  let g2 = abs(fract(tuv * (GRIDF / 16.0)) - vec2f(0.5)) / (GRIDF / 16.0);
+  let line = smoothstep(0.004, 0.010, min(g2.x, g2.y));
+  h.n = n;
+  h.alb = base * mix(1.3, 1.0, line);
+  let sd = vec3f(B) - abs(hp);
+  let m1 = min(sd.x, min(sd.y, sd.z));
+  let mx = max(sd.x, max(sd.y, sd.z));
+  let mid = sd.x + sd.y + sd.z - m1 - mx;
+  h.emit = vec3f(0.10, 0.16, 0.20) * (1.0 - smoothstep(0.0, 0.025, mid));
+
+  // Rocks: shadeRock's noise albedo + perturbed normal.
+  for (var i = 0; i < NROCK; i++) {
+    let c = R.rocks[i].xyz * (2.0 / GRIDF) - vec3f(1.0);
+    let r = R.rocks[i].w * (2.0 / GRIDF);
+    let oc = ro - c;
+    let b = dot(oc, rd);
+    let hq = b * b - (dot(oc, oc) - r * r);
+    if (hq > 0.0) {
+      let t = -b - sqrt(hq);
+      if (t > EPS && t < h.t) {
+        let hit = ro + rd * t;
+        let cell = floor((hit - c) * 60.0 + vec3f(f32(i) * 23.0));
+        let n1 = hash1(cell);
+        let n2 = hash1(cell + vec3f(17.0));
+        let n3 = hash1(cell + vec3f(43.0));
+        let ao = clamp((hit.y + B) * 2.5 + 0.25, 0.25, 1.0);
+        h.t = t;
+        h.n = normalize(normalize(hit - c) + (vec3f(n1, n2, n3) - vec3f(0.5)) * 0.35);
+        h.alb = mix(vec3f(0.30, 0.27, 0.24), vec3f(0.42, 0.40, 0.37), n1) * ao;
+        h.emit = vec3f(0.0);
+      }
+    }
+  }
+  return h;
+}
+
+// Shadow-ray transmittance toward the directional light: rocks are opaque,
+// water attenuates Beer-Lambert along the marched density (this is what
+// paints water shadows and caustic-ish light onto the floor). Walls do not
+// block the light (the closed cube is the world; light enters through them).
+fn lightTransmit(P: vec3f) -> vec3f {
+  let L = R.lightW.xyz;
+  for (var i = 0; i < NROCK; i++) {
+    let c = R.rocks[i].xyz * (2.0 / GRIDF) - vec3f(1.0);
+    let r = R.rocks[i].w * (2.0 / GRIDF);
+    let oc = P - c;
+    let b = dot(oc, L);
+    let hq = b * b - (dot(oc, oc) - r * r);
+    if (hq > 0.0 && -b - sqrt(hq) > EPS) { return vec3f(0.0); }
+  }
+  let inv = 1.0 / L;
+  let ta = (vec3f(-B) - P) * inv;
+  let tb = (vec3f(B) - P) * inv;
+  let tmax3 = max(ta, tb);
+  let tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+  var tau = 0.0;
+  var t = STEP2 * rand(); // dithered start decorrelates step banding
+  for (var i = 0; i < MAXIT2; i++) {
+    if (t > tE) { break; }
+    tau += density(P + L * t) / REST * STEP2;
+    t += STEP2;
+  }
+  return exp(ABSORB * (-6.0 * tau));
+}
+
+// One full path. Returns rgb radiance + a cube mask in w (0 = backdrop
+// pixel, which the tone-map blit passes through unmapped).
+fn samplePath(fragXY: vec2f) -> vec4f {
+  var uv = (fragXY + vec2f(rand(), rand()) - vec2f(0.5)) / R.misc.zw * 2.0 - vec2f(1.0);
+  uv.y = -uv.y; // framebuffer y is top-down in WebGPU
+  var rd = normalize(R.camF.xyz + R.camR.xyz * uv.x * R.res.z * R.res.w + R.camU.xyz * uv.y * R.res.z);
+  let ro0 = R.camPos.xyz;
+
+  let inv = 1.0 / rd;
+  let ta = (vec3f(-B) - ro0) * inv;
+  let tb = (vec3f(B) - ro0) * inv;
+  let tmin3 = min(ta, tb);
+  let tmax3 = max(ta, tb);
+  let t0 = max(max(tmin3.x, tmin3.y), tmin3.z);
+  let tE = min(min(tmax3.x, tmax3.y), tmax3.z);
+  if (tE < max(t0, 0.0)) { // missed the cube: the shared dark backdrop
+    let g = 1.0 - length(uv) * 0.45;
+    return vec4f(vec3f(0.015, 0.02, 0.03) * g, 0.0);
+  }
+
+  var ro = ro0 + rd * (max(t0, 0.0) + EPS);
+  var throughput = vec3f(1.0);
+  var radiance = vec3f(0.0);
+  var inWater = false;
+
+  for (var b = 0; b < MAXB; b++) {
+    let sh = intersectScene(ro, rd);
+    var surface = true; // path ends this segment at sh unless water intervenes
+
+    if (inWater) {
+      // Interior transport: march until the density drops below the iso
+      // (exit event) or the scene hit (underwater wall/rock), accumulating
+      // Beer-Lambert optical depth either way.
+      var tau = 0.0;
+      var tExit = -1.0;
+      var t = 0.0;
+      for (var i = 0; i < MAXIT2; i++) {
+        let tn = min(t + STEP2, sh.t);
+        let mid = 0.5 * (t + tn);
+        let d = density(ro + rd * mid);
+        tau += d / REST * (tn - t);
+        if (d < TISO) {
+          var lo = t;
+          var hi = mid;
+          for (var k = 0; k < 4; k++) {
+            let m2 = 0.5 * (lo + hi);
+            if (density(ro + rd * m2) < TISO) { hi = m2; } else { lo = m2; }
+          }
+          tExit = 0.5 * (lo + hi);
+          break;
+        }
+        t = tn;
+        if (t >= sh.t) { break; }
+      }
+      // Deterministic in-scatter (same constant as the other water shaders;
+      // adds no variance) + Beer-Lambert absorption over the segment.
+      radiance += throughput * vec3f(0.04, 0.16, 0.24) * (1.0 - exp(-12.0 * tau));
+      throughput *= exp(ABSORB * (-6.0 * tau));
+      if (tExit >= 0.0) {
+        let P = ro + rd * tExit;
+        var n = normalize(gradD(P) + vec3f(1e-6, 0.0, 0.0)); // into the water
+        if (dot(n, rd) > 0.0) { n = -n; } // oppose the ray for refract()
+        let rr = refract(rd, n, 1.33); // water -> air
+        if (dot(rr, rr) < 1e-6 || rand() < fresnelS(-dot(rd, n))) {
+          rd = reflect(rd, n); // TIR or roulette reflection: stay inside
+        } else {
+          rd = normalize(rr);
+          inWater = false;
+        }
+        ro = P + rd * EPS;
+        surface = false;
+      }
+      // No exit before the scene: fall through to the (attenuated)
+      // underwater surface event; the path stays inWater.
+    } else {
+      // Water-surface entry before the scene hit? Coarse march + bisection
+      // refine, as fsVolume.
+      var tW = -1.0;
+      var t = STEP * rand(); // dithered start
+      for (var i = 0; i < MAXIT; i++) {
+        t += STEP;
+        if (t > sh.t) { break; }
+        if (density(ro + rd * t) >= TISO) {
+          var lo = t - STEP;
+          var hi = t;
+          for (var k = 0; k < 4; k++) {
+            let m2 = 0.5 * (lo + hi);
+            if (density(ro + rd * m2) >= TISO) { hi = m2; } else { lo = m2; }
+          }
+          tW = 0.5 * (lo + hi);
+          break;
+        }
+      }
+      if (tW > 0.0) {
+        let P = ro + rd * tW;
+        var n = -normalize(gradD(P) + vec3f(1e-6, 0.0, 0.0)); // out of the water
+        if (dot(n, rd) > 0.0) { n = -n; }
+        if (rand() < fresnelS(-dot(rd, n))) {
+          rd = reflect(rd, n);
+        } else {
+          var rr = refract(rd, n, 0.752); // air -> water, no TIR possible
+          if (dot(rr, rr) < 1e-6) { rr = reflect(rd, n); } else { inWater = true; }
+          rd = normalize(rr);
+        }
+        ro = P + rd * EPS;
+        surface = false;
+      }
+    }
+
+    if (surface) {
+      // Diffuse surface event: emission, shadowed direct light, ambient,
+      // then a cosine-weighted bounce (cos/pi folds into the sampling).
+      let P = ro + rd * sh.t;
+      radiance += throughput * sh.emit;
+      let ndl = max(dot(sh.n, R.lightW.xyz), 0.0);
+      var direct = vec3f(0.0);
+      if (ndl > 0.0) { direct = LIGHTCOL * ndl * lightTransmit(P + sh.n * EPS); }
+      radiance += throughput * sh.alb * (direct + AMBIENT);
+      throughput *= sh.alb;
+      rd = cosineDir(sh.n);
+      ro = P + sh.n * EPS;
+    }
+
+    // Russian-roulette termination after bounce 2.
+    if (b >= 2) {
+      let p = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05, 0.95);
+      if (rand() >= p) { break; }
+      throughput *= 1.0 / p;
+    }
+  }
+  return vec4f(radiance, 1.0);
+}
+
+@fragment
+fn fsTrace(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+  let px = vec2i(frag.xy);
+  rngState = (u32(px.x) * 1973u + u32(px.y) * 9277u + TU.frame * 26699u) | 1u;
+  var s = vec4f(0.0);
+  for (var i = 0; i < SPP; i++) {
+    s += samplePath(frag.xy);
+  }
+  s *= 1.0 / f32(SPP);
+  if (TU.frame > 1u) { // frame 1 overwrites: nothing valid to blend with
+    let prev = textureLoad(prevAcc, px, 0);
+    s = mix(prev, s, 1.0 / f32(TU.frame));
+  }
+  return s;
+}
+`;
+
+  // Tone-map blit of the accumulation into the shared scaled rgba8unorm
+  // target (which volUpscale then lifts to the canvas). The mask in .a keeps
+  // the outside-the-cube backdrop unmapped so it matches the other renderers.
+  const traceBlit = `
+@group(0) @binding(0) var accTex: texture_2d<f32>;
+
+@vertex
+fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let p = vec2f(f32((vi << 1u) & 2u), f32(vi & 2u));
+  return vec4f(p * 2.0 - vec2f(1.0), 0.0, 1.0);
+}
+
+@fragment
+fn fsTone(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+  let s = vec2i(textureDimensions(accTex));
+  let px = clamp(vec2i(frag.xy), vec2i(0), s - vec2i(1));
+  let c = textureLoad(accTex, px, 0);
+  // Exposure + Reinhard: near-linear in the darks (the scene's albedos are
+  // dim; a filmic ACES fit crushes the walls to black) while still rolling
+  // off the bright light shafts and foam-white bounce peaks.
+  let x = max(c.rgb, vec3f(0.0)) * 1.4;
+  let mapped = x / (vec3f(1.0) + x);
+  return vec4f(mix(c.rgb, mapped, clamp(c.a, 0.0, 1.0)), 1.0);
+}
+`;
+
   // Upscale blit of the scaled volume target to the canvas.
   const volUpscale = `
 struct UpVSOut {
@@ -1522,5 +1875,7 @@ fn fsUpscale(v: UpVSOut) -> @location(0) vec4f {
     volUpscale,
     mcCompute,
     mesh,
+    trace,
+    traceBlit,
   };
 }

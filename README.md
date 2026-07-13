@@ -131,6 +131,33 @@ but the mode renders the `ssf` path (with a console note, and the stats line
 reads `mesh→ssf` instead of `mesh`). If the WebGPU backend fails to load and
 the app auto-falls back, the stats line marks it as `webgl2 (fallback)`.
 
+`?r=trace` (WebGPU only) is the "let it cook" beauty mode: a **progressive
+path tracer** that accumulates one (or `?spp=`) jittered light path per
+pixel per frame into a floating-point buffer, converging from noise to a
+smooth image over time. The scene needs no acceleration structure — walls
+and rocks are already analytic, and the water is the same tent-blurred
+density grid the volume renderer marches (iso 0.5, coarse march +
+bisection). Water hits split into reflection/refraction by Schlick-Fresnel
+russian roulette; interior segments attenuate Beer–Lambert from the marched
+density (plus the same deterministic in-scatter tint the other water
+shaders use); walls and rocks bounce diffusely (cosine-weighted) with the
+albedos the other renderers shade with. At every surface event a shadow ray
+runs toward the directional light through rocks (opaque) and water
+(attenuating) — so rocks and water cast real colored shadows and thin water
+passes caustic-ish light onto the floor; a small constant ambient stands in
+for the sky (the closed cube is treated as the world, with the light
+shining through the walls), and paths terminate by russian roulette after
+two bounces (`?bounces=` caps depth). The accumulation is tone-mapped
+(exposure + Reinhard) and upscaled from the `?rscale=` target. Selecting
+trace **pauses the simulation** so the image can converge — space resumes
+as always (while the sim runs, the accumulation restarts every frame: a
+live noisy preview); any camera move, rock drag, sim step, or panel change
+also restarts it, and the stats line counts the accumulated samples
+(`spp=`). On WebGL2 the chip falls back to the `ssf` path (`trace→ssf` in
+the stats line). Note that after a grid/particles change while paused, the
+grid-density renderers (volume, voxel, mesh, trace) show no water until the
+sim advances — the freshly rebuilt grid is empty until the first substep.
+
 ## URL parameters
 
 | param  | default    | meaning                                            |
@@ -140,10 +167,12 @@ the app auto-falls back, the stats line marks it as `webgl2 (fallback)`.
 | `s`    | `g` / 32   | simulation substeps per frame                      |
 | `l`    | 2600       | particle lifetime in substeps (spout recycling)    |
 | `warm` | 0          | substeps to pre-simulate before the first frame    |
-| `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume`, `voxel`, `aniso`, `mesh` (WebGPU only) |
-| `rscale`| 0.5       | offscreen target scale for `r=volume`/`r=voxel` (0.1–1) |
+| `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume`, `voxel`, `aniso`, `mesh`/`trace` (WebGPU only) |
+| `rscale`| 0.5       | offscreen target scale for `r=volume`/`r=voxel`/`r=trace` (0.1–1) |
 | `iso`  | 1.5        | density threshold for `r=voxel` cells and the `r=mesh` isosurface (0.1–16) |
 | `k`    | 1.5        | splat elongation gain for `r=aniso` (0–4)          |
+| `spp`  | 1          | paths traced per pixel per frame for `r=trace` (1–8) |
+| `bounces`| 4        | maximum path depth for `r=trace` (1–8)             |
 | `api`  | auto       | backend: `webgpu` or `webgl2` (auto-detects)       |
 | `bench`| off        | time N frames after warmup, then freeze + report   |
 | `dbg`  | off        | overlay with GPU-readback particle statistics      |

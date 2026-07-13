@@ -315,17 +315,18 @@ export async function createBackend({ canvas, fail }) {
     gl.disable(gl.BLEND);
   }
 
-  let meshNoted = false;
+  const wgpuOnlyNoted = new Set();
 
   function render(frame) {
     const { w, h, proj, view, pv, aspect, lightV } = frame;
     if (!RT || RT.w !== w || RT.h !== h) createTargets(w, h);
 
-    // r=mesh is WebGPU-only (compute marching cubes); unknown modes fall
-    // through to the screen-space fluid path below, so just note it once.
-    if (frame.mode === 'mesh' && !meshNoted) {
-      meshNoted = true;
-      console.warn('r=mesh needs WebGPU; rendering the ssf path instead.');
+    // r=mesh (compute marching cubes) and r=trace (path-trace accumulation)
+    // are WebGPU-only; unknown modes fall through to the screen-space fluid
+    // path below, so just note it once per mode.
+    if ((frame.mode === 'mesh' || frame.mode === 'trace') && !wgpuOnlyNoted.has(frame.mode)) {
+      wgpuOnlyNoted.add(frame.mode);
+      console.warn(`r=${frame.mode} needs WebGPU; rendering the ssf path instead.`);
     }
 
     if (frame.mode === 'volume' || frame.mode === 'voxel') {
@@ -498,10 +499,10 @@ export async function createBackend({ canvas, fail }) {
   }
 
   // effectiveMode: what render(frame) actually draws for a selected mode —
-  // r=mesh is WebGPU-only and falls back to the ssf path here, and the app
-  // shell reports that in the stats line (`mesh→ssf`).
+  // r=mesh and r=trace are WebGPU-only and fall back to the ssf path here,
+  // and the app shell reports that in the stats line (`mesh→ssf`).
   return {
     name: 'webgl2', init, substep, render, readParticles, dispose,
-    effectiveMode: (mode) => (mode === 'mesh' ? 'ssf' : mode),
+    effectiveMode: (mode) => (mode === 'mesh' || mode === 'trace' ? 'ssf' : mode),
   };
 }
