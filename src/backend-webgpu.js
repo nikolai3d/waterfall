@@ -50,6 +50,7 @@ export async function createBackend({ canvas, fail }) {
   const bufRenderU = buf(448, UNI);
   const bufBlurX = buf(16, UNI);
   const bufBlurY = buf(16, UNI);
+  const bufTraceU = buf(16, UNI); // r=trace accumulation frame counter
 
   const simLayout = device.createBindGroupLayout({
     entries: [
@@ -129,6 +130,22 @@ export async function createBackend({ canvas, fail }) {
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
     ],
   });
+  // Path tracer (r=trace): the accumulation kernel reads the previous
+  // frame's accumulation (rgba32float: textureLoad only) while rendering
+  // into the other of a ping-pong pair; the tone-map blit reads the result.
+  const traceLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    ],
+  });
+  const traceBlitLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+    ],
+  });
   const simPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [simLayout] });
   const renderPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [renderLayout] });
   const thickPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [thickLayout] });
@@ -139,6 +156,8 @@ export async function createBackend({ canvas, fail }) {
   const volUpPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [volUpLayout] });
   const mcPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [mcLayout] });
   const meshPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [meshLayout] });
+  const tracePipeLayout = device.createPipelineLayout({ bindGroupLayouts: [traceLayout] });
+  const traceBlitPipeLayout = device.createPipelineLayout({ bindGroupLayouts: [traceBlitLayout] });
 
   // MC buffers are config-independent but big (the vertex pool alone is
   // 48 MB), so they are created lazily by ensureMeshResources() on the first
@@ -152,6 +171,14 @@ export async function createBackend({ canvas, fail }) {
   let bufMCVerts = null;
   let bufMCArgs = null;
   const mcArgsReset = new Uint32Array([0, 1, 0, 0, 0]); // vtxCount, instances, firsts, overflow
+
+  // Trace accumulation targets are lazy the same way (rgba32float ping-pong
+  // at the scaled size); created by ensureTraceResources() on the first
+  // trace-mode frame, recreated when the scaled size changes.
+  let traceRT = null;
+  let traceBGs = null;
+  let traceFlip = 0;
+  const traceUData = new Uint32Array(4);
 
   const alphaBlend = {
     color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
@@ -195,7 +222,10 @@ export async function createBackend({ canvas, fail }) {
     cfg = config;
     NCELL = cfg.GRID ** 3;
 
-    const S = makeWGSL({ GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N, ISO: cfg.ISO, K: cfg.K });
+    const S = makeWGSL({
+      GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N, ISO: cfg.ISO, K: cfg.K,
+      SPP: cfg.SPP, BOUNCES: cfg.BOUNCES,
+    });
     const simModule = device.createShaderModule({ code: S.sim });
     const renderModule = device.createShaderModule({ code: S.render });
     const blurModule = device.createShaderModule({ code: S.blur });
@@ -205,6 +235,8 @@ export async function createBackend({ canvas, fail }) {
     const volUpModule = device.createShaderModule({ code: S.volUpscale });
     const mcModule = device.createShaderModule({ code: S.mcCompute });
     const meshModule = device.createShaderModule({ code: S.mesh });
+    const traceModule = device.createShaderModule({ code: S.trace });
+    const traceBlitModule = device.createShaderModule({ code: S.traceBlit });
 
     const ST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     bufPos = buf(cfg.N * 16, ST | GPUBufferUsage.COPY_SRC, cfg.initialData);
@@ -345,6 +377,18 @@ export async function createBackend({ canvas, fail }) {
         primitive: { topology: 'triangle-list' },
         depthStencil: depthState,
       }),
+      trace: device.createRenderPipeline({
+        layout: tracePipeLayout,
+        vertex: { module: traceModule, entryPoint: 'vsFull' },
+        fragment: { module: traceModule, entryPoint: 'fsTrace', targets: [{ format: 'rgba32float' }] },
+        primitive: { topology: 'triangle-list' },
+      }),
+      traceBlit: device.createRenderPipeline({
+        layout: traceBlitPipeLayout,
+        vertex: { module: traceBlitModule, entryPoint: 'vsFull' },
+        fragment: { module: traceBlitModule, entryPoint: 'fsTone', targets: [{ format: 'rgba8unorm' }] },
+        primitive: { topology: 'triangle-list' },
+      }),
     };
 
     volBlurBG = device.createBindGroup({
@@ -366,9 +410,55 @@ export async function createBackend({ canvas, fail }) {
     // mesh-mode frame (and the capped pool buffers on the first one ever).
     mcBG = null;
     meshBG = null;
+    traceBGs = null; // reference the per-config density buffer too
 
     makeRenderBG();
     substepCount = 0;
+  }
+
+  // Trace accumulation ping-pong at the scaled (RSCALE) size. The textures
+  // are per-size (recreated when the scaled target changes), the bind groups
+  // additionally per-config (bufVolDens), which init() handles by nulling
+  // traceBGs. ensureTargets() must have run (RT.volW/volH).
+  function ensureTraceResources() {
+    if (traceRT && (traceRT.w !== RT.volW || traceRT.h !== RT.volH)) {
+      for (const t of traceRT.textures) t.destroy();
+      traceRT = null;
+    }
+    if (!traceRT) {
+      const AT = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING;
+      const mk = () => device.createTexture({
+        size: [RT.volW, RT.volH], format: 'rgba32float', usage: AT,
+      });
+      const texA = mk();
+      const texB = mk();
+      traceRT = {
+        w: RT.volW, h: RT.volH,
+        textures: [texA, texB],
+        views: [texA.createView(), texB.createView()],
+      };
+      traceBGs = null;
+    }
+    if (!traceBGs) {
+      const tbg = (prevView) => device.createBindGroup({
+        layout: traceLayout,
+        entries: [
+          { binding: 0, resource: { buffer: bufRenderU } },
+          { binding: 1, resource: { buffer: bufVolDens } },
+          { binding: 2, resource: prevView },
+          { binding: 3, resource: { buffer: bufTraceU } },
+        ],
+      });
+      const bbg = (accView) => device.createBindGroup({
+        layout: traceBlitLayout,
+        entries: [{ binding: 0, resource: accView }],
+      });
+      // Indexed by the DESTINATION texture: trace[i] reads the other one.
+      traceBGs = {
+        trace: [tbg(traceRT.views[1]), tbg(traceRT.views[0])],
+        blit: [bbg(traceRT.views[0]), bbg(traceRT.views[1])],
+      };
+    }
   }
 
   function ensureMeshResources() {
@@ -577,6 +667,55 @@ export async function createBackend({ canvas, fail }) {
         pass.draw(130);
       }
       pass.end();
+      device.queue.submit([enc.finish()]);
+      return;
+    }
+
+    if (frame.mode === 'trace') {
+      // Progressive path tracer: tent-blur the density grid, extend the
+      // accumulation by one frame (ping-ponged rgba32float, running average
+      // weighted 1/frame), tone-map into the shared scaled target, upscale.
+      // frame.accFrame is the app's accumulation counter; 1 (or absent)
+      // means restart — camera/rocks/sim/config changed.
+      ensureTraceResources();
+      traceUData[0] = Math.max(frame.accFrame || 0, 1);
+      device.queue.writeBuffer(bufTraceU, 0, traceUData);
+
+      const cpass = enc.beginComputePass();
+      cpass.setPipeline(pipes.volBlur);
+      cpass.setBindGroup(0, volBlurBG);
+      cpass.dispatchWorkgroups(Math.ceil(NCELL / 64));
+      cpass.end();
+
+      let pass = enc.beginRenderPass({
+        colorAttachments: [{ view: traceRT.views[traceFlip], loadOp: 'clear', storeOp: 'store' }],
+      });
+      pass.setPipeline(pipes.trace);
+      pass.setBindGroup(0, traceBGs.trace[traceFlip]);
+      pass.draw(3);
+      pass.end();
+
+      pass = enc.beginRenderPass({
+        colorAttachments: [{ view: RT.v.volColor, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
+      });
+      pass.setPipeline(pipes.traceBlit);
+      pass.setBindGroup(0, traceBGs.blit[traceFlip]);
+      pass.draw(3);
+      pass.end();
+
+      pass = enc.beginRenderPass({
+        colorAttachments: [{ view: canvasView, loadOp: 'clear', storeOp: 'store', clearValue: clearCol }],
+      });
+      pass.setPipeline(pipes.volUpscale);
+      pass.setBindGroup(0, RT.volUpBG);
+      pass.draw(3);
+      if (frame.gizmo) {
+        pass.setPipeline(pipes.gizmo);
+        pass.setBindGroup(0, renderBGGroup);
+        pass.draw(130);
+      }
+      pass.end();
+      traceFlip ^= 1;
       device.queue.submit([enc.finish()]);
       return;
     }

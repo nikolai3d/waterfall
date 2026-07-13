@@ -33,6 +33,14 @@ if (!(ISO >= 0.1 && ISO <= 16)) ISO = 1.5;
 let K = parseFloat(params.get('k') || '1.5');
 if (!(K >= 0 && K <= 4)) K = 1.5;
 
+// Path tracer (r=trace) knobs, baked into the shader at init: ?spp= paths
+// per pixel per frame (more = faster convergence, slower frames) and
+// ?bounces= max path depth. Garbage or out-of-range falls back to defaults.
+let SPP = parseInt(params.get('spp') || '1', 10);
+if (!(SPP >= 1 && SPP <= 8)) SPP = 1;
+let BOUNCES = parseInt(params.get('bounces') || '4', 10);
+if (!(BOUNCES >= 1 && BOUNCES <= 8)) BOUNCES = 4;
+
 // The CFL clamp caps velocity in cells/substep, so finer grids need more
 // substeps per frame to move at the same world-space speed.
 const defaultSubsteps = () => Math.max(1, Math.round(GRID / 32));
@@ -141,7 +149,7 @@ function initialParticleData() {
 function config() {
   N = PTEX * PTEX;
   updateRockData();
-  return { GRID, PTEX, LIFE, N, RSCALE, ISO, K, initialData: initialParticleData(), rockData, rockVel };
+  return { GRID, PTEX, LIFE, N, RSCALE, ISO, K, SPP, BOUNCES, initialData: initialParticleData(), rockData, rockVel };
 }
 
 backend.init(config());
@@ -359,13 +367,24 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyF') {
     // Cycle through all renderer chips in panel order.
     const modes = [...panel.querySelectorAll('button[data-r]')].map((b) => b.dataset.r);
-    renderMode = modes[(modes.indexOf(renderMode) + 1) % modes.length];
-    syncURL();
-    syncPanel();
+    setRenderMode(modes[(modes.indexOf(renderMode) + 1) % modes.length]);
   }
 });
 
-let renderMode = ['points', 'ssf', 'volume', 'voxel', 'aniso', 'mesh'].includes(params.get('r')) ? params.get('r') : 'ssf';
+let renderMode = ['points', 'ssf', 'volume', 'voxel', 'aniso', 'mesh', 'trace'].includes(params.get('r')) ? params.get('r') : 'ssf';
+
+// r=trace is a progressive accumulator ("let it cook"): entering it pauses
+// the sim so the image can converge; space toggles as always (a running sim
+// resets the accumulation every frame = live noisy preview). Leaving trace
+// does not auto-unpause.
+if (renderMode === 'trace') paused = true;
+
+function setRenderMode(m) {
+  if (m === 'trace' && renderMode !== 'trace') paused = true;
+  renderMode = m;
+  syncURL();
+  syncPanel();
+}
 
 // Resolution panel: changing a value rebuilds the whole sim in place
 // (camera and pause state survive); the URL stays shareable.
@@ -406,9 +425,7 @@ panel.addEventListener('click', (e) => {
     PTEX = p;
   } else if (b.dataset.r) {
     // Renderer switch: no sim restart, just a different render path.
-    renderMode = b.dataset.r;
-    syncURL();
-    syncPanel();
+    setRenderMode(b.dataset.r);
     return;
   } else {
     return;
@@ -450,6 +467,30 @@ resize();
 
 let frames = 0, lastFps = performance.now();
 let totalSubsteps = 0;
+
+// r=trace accumulation generation: any change to what a path can see —
+// camera, canvas size, sim state (substeps advance), rocks, or the
+// grid/particle/scale config — restarts the accumulation. The app owns the
+// counter (frames since the last change, 1-based) and hands it to the
+// backend as frame.accFrame; the HUD's spp readout is frames x ?spp=.
+let accKey = '';
+let accFrames = 0;
+
+function traceAccum(f) {
+  const eff = backend.effectiveMode ? backend.effectiveMode(renderMode) : renderMode;
+  if (eff !== 'trace') {
+    accKey = '';
+    accFrames = 0;
+    return;
+  }
+  const key = `${cam.az}|${cam.el}|${cam.dist}|${f.w}|${f.h}|${GRID}|${PTEX}|${RSCALE}|${totalSubsteps}|${rockData.join(',')}`;
+  if (key !== accKey) {
+    accKey = key;
+    accFrames = 0;
+  }
+  accFrames++;
+  f.accFrame = accFrames;
+}
 
 function step() {
   advanceRocks();
@@ -506,7 +547,9 @@ function tick(now) {
     if (now - lastInteraction > 4000 && !dragging && !rockDrag) cam.az += 0.0012;
   }
   updateDragText();
-  backend.render(frameState());
+  const frame = frameState();
+  traceAccum(frame);
+  backend.render(frame);
   benchTick();
 
   frames++;
@@ -521,9 +564,10 @@ function tick(now) {
     const modeToken = eff === renderMode ? renderMode : `${renderMode}→${eff}`;
     statsEl.textContent =
       `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${modeToken}` +
-      (eff === 'volume' || eff === 'voxel' ? ` rscale=${RSCALE}` : '') +
+      (eff === 'volume' || eff === 'voxel' || eff === 'trace' ? ` rscale=${RSCALE}` : '') +
       (eff === 'voxel' || eff === 'mesh' ? ` iso=${ISO}` : '') +
-      (eff === 'aniso' ? ` k=${K}` : '') + ` · ${backendLabel}` +
+      (eff === 'aniso' ? ` k=${K}` : '') +
+      (eff === 'trace' ? ` spp=${accFrames * SPP}` : '') + ` · ${backendLabel}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;
