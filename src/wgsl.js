@@ -1339,7 +1339,11 @@ fn gradG(p: vec3f) -> vec3f {
 // MC boundary trick: the isosurface caps against the walls wherever water
 // meets the domain boundary instead of leaving open backfaces.
 fn latDens(c: vec3i) -> f32 {
-  if (any(c < vec3i(0)) || any(c >= vec3i(GRIDI))) { return 0.0; }
+  // Lattice 0 counts as outside too: cubes span cells 0..GRID-1, so without
+  // it an isosurface crossing a lattice-0 face would be left uncapped on the
+  // low walls (the high side gets its cap from the c >= GRIDI shell). Only
+  // blur bleed outside the walls (cells 2..GRID-2) is discarded.
+  if (any(c < vec3i(1)) || any(c >= vec3i(GRIDI))) { return 0.0; }
   return dens[cellIndex(c)].x;
 }
 
