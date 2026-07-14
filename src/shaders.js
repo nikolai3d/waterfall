@@ -108,9 +108,13 @@ float hash1(vec3 p) {
 // isolation-weighted, per-particle-hashed factor so spray reads as fine and
 // size-varied instead of uniform spheres. Dense water (iso = 0) and
 // uSpray = 0 keep exactly PRADIUS. Mirrors splatRadius in wgsl.js.
-float sprayRadius(float iso, uint pid) {
+float sprayRadius(float iso, uint pid, float age) {
   float h = hash3(pid * 1597334677u).x;
-  return PRADIUS * clamp(1.0 - uSpray * iso * (0.62 - 0.30 * h), 0.15, 1.0);
+  float r = PRADIUS * clamp(1.0 - uSpray * iso * (0.62 - 0.30 * h), 0.15, 1.0);
+  // Isolated droplets shrink out near end-of-life so the lingerer GC's
+  // early recycling reads as evaporation, not a pop.
+  r *= mix(1.0, clamp((LIFE - age) / 60.0, 0.2, 1.0), step(0.4, iso));
+  return r;
 }
 `;
 
@@ -274,7 +278,7 @@ void main() {
 
   // G2P: gather velocity and affine matrix C, advect, handle spawning.
   const fsG2P = header + `
-uniform sampler2D uPos, uGrid, uAux, uC0;
+uniform sampler2D uPos, uGrid, uAux, uC0, uVel;
 uniform float uFrame;
 layout(location = 0) out vec4 oPos;
 layout(location = 1) out vec4 oVel;
@@ -326,8 +330,29 @@ void main() {
   // water, ->1 for lone spray droplets. Instantaneous value from this
   // substep's density pass, temporally smoothed against popping, spawn-age
   // guarded so the deliberately dense fresh spout stream can't flicker.
-  float isoI = clamp(1.0 - texelFetch(uAux, pt, 0).x / (0.5 * REST), 0.0, 1.0);
-  float iso = mix(texelFetch(uC0, pt, 0).w, isoI, 0.15) * clamp(age / 30.0, 0.0, 1.0);
+  // Two isolation signals: the density-pass rho is SMEARED over 27 cells,
+  // so a droplet hovering a cell above the pool inherits the pool's mass
+  // and never classifies as isolated — exactly the droplets that hover in
+  // the grid's pressure-supported cushion. The own-node mass is local: a
+  // lone droplet deposits ~0.5 there, anything sitting in/on water >= 2.
+  float isoD = clamp(1.0 - texelFetch(uAux, pt, 0).x / (0.5 * REST), 0.0, 1.0);
+  float ownM = gridFetch(uGrid, ivec3(floor(p + 0.5))).w;
+  float isoL = clamp(1.0 - ownM / 2.0, 0.0, 1.0);
+  float isoI = max(isoD, isoL);
+  // Asymmetric smoothing: isolation ramps up slowly (no popping) but decays
+  // fast, so a droplet plunging into the pool recouples within a few steps.
+  float isoPrev = texelFetch(uC0, pt, 0).w;
+  float iso = mix(isoPrev, isoI, isoI > isoPrev ? 0.08 : 0.5) * clamp(age / 30.0, 0.0, 1.0);
+
+  // Ballistic spray: isolated droplets integrate their own velocity +
+  // gravity instead of the grid's. Near still water or rock-boundary cells
+  // the gathered field is pressure-supported / velocity-clamped, so a lone
+  // droplet inherits ~zero velocity and parachutes ("hovering droplets").
+  // Blending toward self-integration restores real free fall; full grid
+  // coupling returns as soon as the droplet re-enters dense water (iso->0).
+  float bal = smoothstep(0.3, 0.8, iso);
+  v = mix(v, texelFetch(uVel, pt, 0).xyz + vec3(0.0, GRAV, 0.0), bal);
+  C *= (1.0 - bal); // stale affine field must not scatter for spray
 
   // Sub-grid dispersion: hashed velocity jitter, gated by iso^2 so pressured
   // water gets exactly zero and only ballistic separated particles disperse
@@ -344,9 +369,22 @@ void main() {
     float vn = dot(v, n);
     if (vn < 0.0) v -= n * vn;
   }
+  // Anti-stick: an isolated droplet resting on/near a rock slides downhill.
+  // Free-slip alone lets droplets perch near a rock's top indefinitely
+  // (the tangential gravity component vanishes at the pole).
+  if (sd < 0.6 && iso > 0.4) {
+    vec3 nr = rockNormal(p);
+    vec3 gv = vec3(0.0, GRAV, 0.0);
+    v += (gv - nr * dot(gv, nr)) * (6.0 * iso);
+  }
   p = clamp(p, vec3(2.0), vec3(GRIDF - 2.0));
 
-  oPos = vec4(p, age);
+  // Lingerer GC: stationary isolated droplets (perched, wedged, or hovering)
+  // age out early instead of hanging around for the full lifetime.
+  float ageOut = age;
+  if (iso > 0.6 && dot(v, v) < 4e-4) ageOut = age + 8.0;
+
+  oPos = vec4(p, ageOut);
   oVel = vec4(v, length(v));
   oC0 = vec4(C[0], iso);
   oC1 = vec4(C[1], 0.0);
@@ -368,7 +406,7 @@ void main() {
   vec4 pa = texelFetch(uPos, pt, 0);
   if (pa.w < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vCenterV = vec3(0.0); vSpeed = 0.0; vPr = 0.0; return; }
 
-  float pr = sprayRadius(texelFetch(uC0, pt, 0).w, uint(gl_VertexID));
+  float pr = sprayRadius(texelFetch(uC0, pt, 0).w, uint(gl_VertexID), pa.w);
   vec3 wp = pa.xyz * (2.0 / GRIDF) - 1.0;
   vec4 vp = uView * vec4(wp, 1.0);
   gl_Position = uProj * vp;
@@ -452,7 +490,7 @@ void main() {
   ivec2 pt = ivec2(gl_VertexID % PTEX, gl_VertexID / PTEX);
   vec4 pa = texelFetch(uPos, pt, 0);
   if (pa.w < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vSpeed = 0.0; vZ = 0.0; vPr = 0.0; return; }
-  float pr = sprayRadius(texelFetch(uC0, pt, 0).w, uint(gl_VertexID));
+  float pr = sprayRadius(texelFetch(uC0, pt, 0).w, uint(gl_VertexID), pa.w);
   vec3 wp = pa.xyz * (2.0 / GRIDF) - 1.0;
   vec4 vp = uView * vec4(wp, 1.0);
   gl_Position = uProj * vp;
@@ -547,7 +585,7 @@ void main() {
   vec3 m2 = cross(axis, m1);
   // Spray shrink scales both semi-axes; the thickness amplitude follows via
   // its existing 2/|qz| footprint normalization (no extra plumbing needed).
-  float pr = sprayRadius(texelFetch(uC0, pt, 0).w, uint(gl_VertexID));
+  float pr = sprayRadius(texelFetch(uC0, pt, 0).w, uint(gl_VertexID), pa.w);
   float ra = pr * elong * SIZE_MUL;              // major semi-axis
   float rb = pr * inversesqrt(elong) * SIZE_MUL; // minors conserve volume
 

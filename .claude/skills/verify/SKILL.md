@@ -88,6 +88,18 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
   assert on it in harnesses to confirm a mode/param took effect.
 - macOS has no `timeout` command.
 
+## Sim-state diagnostics (readback beats screenshots)
+
+`?dbg=1` exposes `window.__wf` (backend handle + live params). For "is this
+a sim bug or a render bug?" questions, read particle state directly in a
+real-time harness: `await __wf.backend.readParticles()` (pos+age) twice a
+few seconds apart finds stuck/hovering particles by displacement;
+`readC()` (WebGPU) returns the C-matrix buffer incl. the isolation signal
+in `[i*12+3]`. NOTE: the dev server must send no-store headers (see
+scratchpad nocache_server.py) — the plain `python3 -m http.server` lets
+Chrome heuristically cache modules, so a user's tab can silently test
+STALE code while fresh headless profiles test new code.
+
 ## Driving the UI (clicks) headlessly
 
 `--screenshot` can't click. Write a temporary same-origin harness page in the

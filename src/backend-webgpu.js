@@ -247,7 +247,7 @@ export async function createBackend({ canvas, fail }) {
     const ST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     bufPos = buf(cfg.N * 16, ST | GPUBufferUsage.COPY_SRC, cfg.initialData);
     bufVel = buf(cfg.N * 16, ST, new Float32Array(cfg.N * 4));
-    bufC = buf(cfg.N * 48, ST, new Float32Array(cfg.N * 12));
+    bufC = buf(cfg.N * 48, ST | GPUBufferUsage.COPY_SRC, new Float32Array(cfg.N * 12));
     bufAux = buf(cfg.N * 16, ST);
     bufGridA = buf(NCELL * 16, ST);
     bufGridV = buf(NCELL * 16, ST);
@@ -866,6 +866,23 @@ export async function createBackend({ canvas, fail }) {
     device.queue.submit([enc.finish()]);
   }
 
+  // Debug readback of the C-matrix buffer (cmat[3i].w = isolation) — used
+  // by ?dbg diagnostics; same staging pattern as readParticles.
+  async function readC() {
+    const size = cfg.N * 48;
+    const staging = device.createBuffer({
+      size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(bufC, 0, staging, 0, size);
+    device.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    return out;
+  }
+
   async function readParticles() {
     const size = cfg.N * 16;
     const staging = device.createBuffer({
@@ -890,7 +907,7 @@ export async function createBackend({ canvas, fail }) {
 
   // effectiveMode: this backend implements every render mode as selected.
   return {
-    name: 'webgpu', init, substep, render, readParticles, dispose,
+    name: 'webgpu', init, substep, render, readParticles, readC, dispose,
     effectiveMode: (mode) => mode,
   };
 }

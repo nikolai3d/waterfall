@@ -289,6 +289,7 @@ export async function createBackend({ canvas, fail }) {
     gl.useProgram(progG2P);
     bindTex(0, cur.pos, progG2P, 'uPos');
     bindTex(1, gridB, progG2P, 'uGrid');
+    bindTex(4, cur.vel, progG2P, 'uVel'); // ballistic spray reads previous velocity
     bindTex(2, densTex, progG2P, 'uAux');
     bindTex(3, cur.c0, progG2P, 'uC0');
     gl.uniform4fv(u(progG2P, 'uRocks'), cfg.rockData);

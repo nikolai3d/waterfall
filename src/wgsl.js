@@ -292,8 +292,30 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
   // dense water, ->1 for lone spray droplets. Instantaneous value from this
   // substep's density pass, temporally smoothed against popping, spawn-age
   // guarded so the deliberately dense fresh spout stream can't flicker.
-  let isoI = clamp(1.0 - aux[i].x / (0.5 * REST), 0.0, 1.0);
-  let iso = mix(cmat[i * 3u].w, isoI, 0.15) * clamp(age / 30.0, 0.0, 1.0);
+  // Two isolation signals: the density-pass rho is SMEARED over 27 cells,
+  // so a droplet hovering a cell above the pool inherits the pool's mass
+  // and never classifies as isolated — exactly the droplets that hover in
+  // the grid's pressure-supported cushion. The own-node mass is local: a
+  // lone droplet deposits ~0.5 there, anything sitting in/on water >= 2.
+  let isoD = clamp(1.0 - aux[i].x / (0.5 * REST), 0.0, 1.0);
+  let ownM = gridV[cellIndex(vec3i(floor(p + vec3f(0.5))))].w;
+  let isoL = clamp(1.0 - ownM / 2.0, 0.0, 1.0);
+  let isoI = max(isoD, isoL);
+  // Asymmetric smoothing: isolation ramps up slowly (no popping) but decays
+  // fast, so a droplet plunging into the pool recouples within a few steps.
+  let isoPrev = cmat[i * 3u].w;
+  let isoRate = select(0.5, 0.08, isoI > isoPrev);
+  let iso = mix(isoPrev, isoI, isoRate) * clamp(age / 30.0, 0.0, 1.0);
+
+  // Ballistic spray: isolated droplets integrate their own velocity +
+  // gravity instead of the grid's. Near still water or rock-boundary cells
+  // the gathered field is pressure-supported / velocity-clamped, so a lone
+  // droplet inherits ~zero velocity and parachutes ("hovering droplets").
+  // Blending toward self-integration restores real free fall; full grid
+  // coupling returns as soon as the droplet re-enters dense water (iso->0).
+  let bal = smoothstep(0.3, 0.8, iso);
+  v = mix(v, vel[i].xyz + vec3f(0.0, GRAV, 0.0), bal);
+  let C2 = C * (1.0 - bal); // stale affine field must not scatter for spray
 
   // Sub-grid dispersion: hashed velocity jitter, gated by iso^2 so pressured
   // water gets exactly zero and only ballistic separated particles disperse
@@ -310,13 +332,26 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
     let vn = dot(v, n);
     if (vn < 0.0) { v -= n * vn; }
   }
+  // Anti-stick: an isolated droplet resting on/near a rock slides downhill.
+  // Free-slip alone lets droplets perch near a rock's top indefinitely
+  // (the tangential gravity component vanishes at the pole).
+  if (sd < 0.6 && iso > 0.4) {
+    let nr = rockNormal(p);
+    let gv = vec3f(0.0, GRAV, 0.0);
+    v += (gv - nr * dot(gv, nr)) * (6.0 * iso);
+  }
   p = clamp(p, vec3f(2.0), vec3f(GRIDF - 2.0));
 
-  pos[i] = vec4f(p, age);
+  // Lingerer GC: stationary isolated droplets (perched, wedged, or hovering)
+  // age out early instead of hanging around for the full lifetime.
+  var ageOut = age;
+  if (iso > 0.6 && dot(v, v) < 4e-4) { ageOut = age + 8.0; }
+
+  pos[i] = vec4f(p, ageOut);
   vel[i] = vec4f(v, length(v));
-  cmat[i * 3u] = vec4f(C[0], iso);
-  cmat[i * 3u + 1u] = vec4f(C[1], 0.0);
-  cmat[i * 3u + 2u] = vec4f(C[2], 0.0);
+  cmat[i * 3u] = vec4f(C2[0], iso);
+  cmat[i * 3u + 1u] = vec4f(C2[1], 0.0);
+  cmat[i * 3u + 2u] = vec4f(C2[2], 0.0);
 }
 `;
 
@@ -357,7 +392,12 @@ struct RenderU {
 fn splatRadius(ii: u32) -> f32 {
   let iso = cmat[ii * 3u].w;
   let h = hash3(ii * 1597334677u).x;
-  return PRADIUS * clamp(1.0 - R.fx.x * iso * (0.62 - 0.30 * h), 0.15, 1.0);
+  var r = PRADIUS * clamp(1.0 - R.fx.x * iso * (0.62 - 0.30 * h), 0.15, 1.0);
+  // Isolated droplets shrink out near end-of-life so the lingerer GC's
+  // early recycling reads as evaporation, not a pop.
+  let age = pos[ii].w;
+  r *= mix(1.0, clamp((LIFE - age) / 60.0, 0.2, 1.0), step(0.4, iso));
+  return r;
 }
 
 @vertex
