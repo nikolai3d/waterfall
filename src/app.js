@@ -52,6 +52,9 @@ if (!(BOUNCES >= 1 && BOUNCES <= 8)) BOUNCES = 4;
 // out-of-range values fall back to the default 1.
 let SPRAY = parseFloat(params.get('spray') || '1');
 if (!(SPRAY >= 0 && SPRAY <= 2)) SPRAY = 1;
+// Live value shared with the backends (rockData precedent): panel chips
+// mutate it in place; backends re-upload per substep/frame — no restart.
+const sprayRef = new Float32Array([SPRAY]);
 
 // The CFL clamp caps velocity in cells/substep, so finer grids need more
 // substeps per frame to move at the same world-space speed.
@@ -161,7 +164,7 @@ function initialParticleData() {
 function config() {
   N = PTEX * PTEX;
   updateRockData();
-  return { GRID, PTEX, LIFE, N, RSCALE, ISO, MISO, K, SPP, BOUNCES, SPRAY, initialData: initialParticleData(), rockData, rockVel };
+  return { GRID, PTEX, LIFE, N, RSCALE, ISO, MISO, K, SPP, BOUNCES, sprayRef, initialData: initialParticleData(), rockData, rockVel };
 }
 
 backend.init(config());
@@ -417,6 +420,9 @@ function syncPanel() {
   for (const b of panel.querySelectorAll('button[data-r]')) {
     b.classList.toggle('on', b.dataset.r === renderMode);
   }
+  for (const b of panel.querySelectorAll('button[data-spray]')) {
+    b.classList.toggle('on', parseFloat(b.dataset.spray) === SPRAY);
+  }
 }
 syncPanel();
 
@@ -425,6 +431,7 @@ function syncURL() {
   q.set('g', GRID);
   q.set('p', PTEX);
   q.set('r', renderMode);
+  q.set('spray', SPRAY);
   history.replaceState(null, '', '?' + q.toString());
 }
 
@@ -443,6 +450,13 @@ panel.addEventListener('click', (e) => {
   } else if (b.dataset.r) {
     // Renderer switch: no sim restart, just a different render path.
     setRenderMode(b.dataset.r);
+    return;
+  } else if (b.dataset.spray) {
+    // Spray strength is a live uniform: no restart, takes effect next frame.
+    SPRAY = parseFloat(b.dataset.spray);
+    sprayRef[0] = SPRAY;
+    syncURL();
+    syncPanel();
     return;
   } else {
     return;

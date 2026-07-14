@@ -9,8 +9,8 @@ import { ROCKS, THICK_MUL, ANISO_AGE } from './shaders.js';
 import { MC_ROW, MC_CAP, MC_CORNERS, MC_EDGES } from './mctables.js';
 
 export function makeWGSL(opts) {
-  // ISO/K/SPP/BOUNCES/SPRAY are validated/defaulted in app.js.
-  const { GRID, LIFE, N, ISO, MISO, K, SPP = 1, BOUNCES = 4, SPRAY = 1 } = opts;
+  // ISO/K/SPP/BOUNCES are validated/defaulted in app.js (spray is a live uniform).
+  const { GRID, LIFE, N, ISO, MISO, K, SPP = 1, BOUNCES = 4 } = opts;
   const s = GRID / 64;
   const vec3f = (a) => `vec3f(${a.map((v) => v.toFixed(2)).join(', ')})`;
   const NROCK = ROCKS.length;
@@ -35,7 +35,6 @@ const EMIT_R: vec3f = ${vec3f([2 * s, 1.5 * s, 13 * s])};  // spout extent
 const EMIT_V: vec3f = vec3f(0.10, -0.05, 0.0);             // initial jet velocity
 
 const PRADIUS: f32 = 0.021; // particle render radius, world units
-const SPRAY: f32 = ${SPRAY.toFixed(4)}; // ?spray= strength (0 disables jitter + shrink exactly)
 const SPRAY_JIT: f32 = 0.06;            // dispersion jitter at iso = 1, cells/substep
 const NROCK: i32 = ${NROCK};
 const FX: f32 = 65536.0;    // fixed-point scale for grid atomics
@@ -74,7 +73,8 @@ struct SimU {
   rocks: array<vec4f, ${NROCK}>,   // xyz center + radius, grid units
   rockVel: array<vec4f, ${NROCK}>, // xyz, grid units per substep
   frame: u32,
-  _p0: u32, _p1: u32, _p2: u32,
+  spray: f32, // live ?spray=/panel strength (0 disables jitter exactly)
+  _p1: u32, _p2: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> pos: array<vec4f>;  // xyz + age
@@ -299,7 +299,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
   // water gets exactly zero and only ballistic separated particles disperse
   // (breaks clumps into fine varied spray). CFL-safe: SPRAY_JIT << VMAX.
   v += (hash3(i * 2246822519u + U.frame * 3266489917u) - vec3f(0.5)) *
-    (SPRAY_JIT * SPRAY * iso * iso);
+    (SPRAY_JIT * U.spray * iso * iso);
 
   p += v; // dt = 1
 
@@ -339,6 +339,7 @@ struct RenderU {
   misc: vec4f,  // pointScale (h * proj[5]), halfH * proj[5], volume target w, h
   rocks: array<vec4f, ${NROCK}>, // grid units
   gizmo: array<vec4f, 3>,        // a.xyz + active, b.xyz + radius, unused
+  fx: vec4f,                     // x = spray strength (live), yzw unused
 };
 `;
 
@@ -356,7 +357,7 @@ struct RenderU {
 fn splatRadius(ii: u32) -> f32 {
   let iso = cmat[ii * 3u].w;
   let h = hash3(ii * 1597334677u).x;
-  return PRADIUS * clamp(1.0 - SPRAY * iso * (0.62 - 0.30 * h), 0.15, 1.0);
+  return PRADIUS * clamp(1.0 - R.fx.x * iso * (0.62 - 0.30 * h), 0.15, 1.0);
 }
 
 @vertex

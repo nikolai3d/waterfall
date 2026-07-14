@@ -23,7 +23,7 @@ export function gridLayout(GRID) {
 }
 
 export function makeShaders(opts) {
-  const { GRID, PTEX, LIFE, ISO, K, SPRAY = 1 } = opts; // ISO/K/SPRAY validated/defaulted in app.js
+  const { GRID, PTEX, LIFE, ISO, K } = opts; // ISO/K validated/defaulted in app.js (spray is a uniform)
   const { TILES, GTEX } = gridLayout(GRID);
   const s = GRID / 64;
   const vec3 = (a) => `vec3(${a.map((v) => v.toFixed(2)).join(', ')})`;
@@ -53,7 +53,7 @@ const vec3 EMIT_R = ${vec3([2 * s, 1.5 * s, 13 * s])};  // spout extent (a wide 
 const vec3 EMIT_V = vec3(0.10, -0.05, 0.0);  // initial jet velocity
 
 const float PRADIUS = 0.021;     // particle render radius, world units
-const float SPRAY = ${SPRAY.toFixed(4)}; // ?spray= strength (0 disables jitter + shrink exactly)
+uniform float uSpray;            // live ?spray=/panel strength (0 disables jitter + shrink exactly)
 const float SPRAY_JIT = 0.06;    // dispersion jitter at iso = 1, cells/substep
 
 const int NROCK = ${ROCKS.length};
@@ -107,10 +107,10 @@ float hash1(vec3 p) {
 // Effective splat radius: isolated particles (spray droplets) shrink by an
 // isolation-weighted, per-particle-hashed factor so spray reads as fine and
 // size-varied instead of uniform spheres. Dense water (iso = 0) and
-// SPRAY = 0 keep exactly PRADIUS. Mirrors splatRadius in wgsl.js.
+// uSpray = 0 keep exactly PRADIUS. Mirrors splatRadius in wgsl.js.
 float sprayRadius(float iso, uint pid) {
   float h = hash3(pid * 1597334677u).x;
-  return PRADIUS * clamp(1.0 - SPRAY * iso * (0.62 - 0.30 * h), 0.15, 1.0);
+  return PRADIUS * clamp(1.0 - uSpray * iso * (0.62 - 0.30 * h), 0.15, 1.0);
 }
 `;
 
@@ -333,7 +333,7 @@ void main() {
   // water gets exactly zero and only ballistic separated particles disperse
   // (breaks clumps into fine varied spray). CFL-safe: SPRAY_JIT << VMAX.
   v += (hash3(uint(pid) * 2246822519u + uint(uFrame) * 3266489917u) - 0.5) *
-    (SPRAY_JIT * SPRAY * iso * iso);
+    (SPRAY_JIT * uSpray * iso * iso);
 
   p += v; // dt = 1
 

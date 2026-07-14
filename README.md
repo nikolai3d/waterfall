@@ -186,7 +186,7 @@ sim advances — the freshly rebuilt grid is empty until the first substep.
 | `rscale`| 0.5       | offscreen target scale for `r=volume`/`r=voxel`/`r=trace` (0.1–1) |
 | `iso`  | 1.5 / 0.5  | density threshold, voxel / mesh defaults; setting it drives both (0.1–16) |
 | `k`    | 1.5        | splat elongation gain for `r=aniso` (0–4)          |
-| `spray`| 1          | droplet spray strength: sim dispersion jitter + splat shrink (0–2; 0 = off exactly) |
+| `spray`| 1          | droplet spray strength: sim dispersion jitter + splat shrink (0–2; 0 = off exactly), live-adjustable from the panel |
 | `spp`  | 1          | paths traced per pixel per frame for `r=trace` (1–8) |
 | `bounces`| 4        | maximum path depth for `r=trace` (1–8)             |
 | `api`  | auto       | backend: `webgpu` or `webgl2` (auto-detects)       |

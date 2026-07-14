@@ -150,7 +150,7 @@ export async function createBackend({ canvas, fail }) {
     cfg = config;
     GTEX = gridLayout(cfg.GRID).GTEX;
 
-    const S = makeShaders({ GRID: cfg.GRID, PTEX: cfg.PTEX, LIFE: cfg.LIFE, ISO: cfg.ISO, K: cfg.K, SPRAY: cfg.SPRAY });
+    const S = makeShaders({ GRID: cfg.GRID, PTEX: cfg.PTEX, LIFE: cfg.LIFE, ISO: cfg.ISO, K: cfg.K });
     progP2G1 = compile(S.vsP2G1, S.fsScatter, 'p2g1');
     progP2G2 = compile(S.vsP2G2, S.fsScatter, 'p2g2');
     progDensity = compile(S.vsQuad, S.fsDensity, 'density');
@@ -293,6 +293,7 @@ export async function createBackend({ canvas, fail }) {
     bindTex(3, cur.c0, progG2P, 'uC0');
     gl.uniform4fv(u(progG2P, 'uRocks'), cfg.rockData);
     gl.uniform1f(u(progG2P, 'uFrame'), substepCount);
+    gl.uniform1f(u(progG2P, 'uSpray'), cfg.sprayRef[0]);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     [cur, nxt] = [nxt, cur];
@@ -396,6 +397,7 @@ export async function createBackend({ canvas, fail }) {
       bindTex(0, cur.pos, progPoints, 'uPos');
       bindTex(1, cur.vel, progPoints, 'uVel');
       bindTex(2, cur.c0, progPoints, 'uC0'); // isolation in .w (spray shrink)
+      gl.uniform1f(u(progPoints, 'uSpray'), cfg.sprayRef[0]);
       gl.uniformMatrix4fv(u(progPoints, 'uProj'), false, proj);
       gl.uniformMatrix4fv(u(progPoints, 'uView'), false, view);
       gl.uniform1f(u(progPoints, 'uPointScale'), h * proj[5]);
@@ -426,6 +428,7 @@ export async function createBackend({ canvas, fail }) {
     bindTex(0, cur.pos, pd, 'uPos');
     bindTex(1, cur.vel, pd, 'uVel');
     bindTex(2, cur.c0, pd, 'uC0'); // isolation in .w (spray shrink)
+    gl.uniform1f(u(pd, 'uSpray'), cfg.sprayRef[0]);
     gl.uniformMatrix4fv(u(pd, 'uProj'), false, proj);
     gl.uniformMatrix4fv(u(pd, 'uView'), false, view);
     gl.uniform1f(u(pd, 'uPointScale'), h * proj[5]);
@@ -464,6 +467,7 @@ export async function createBackend({ canvas, fail }) {
     // contribution (the blurred depth's near-clamped halo would fake holes).
     bindTex(2, RT.waterDepth, tk, 'uFront');
     bindTex(3, cur.c0, tk, 'uC0'); // isolation in .w (spray shrink)
+    gl.uniform1f(u(tk, 'uSpray'), cfg.sprayRef[0]);
     gl.uniformMatrix4fv(u(tk, 'uProj'), false, proj);
     gl.uniformMatrix4fv(u(tk, 'uView'), false, view);
     gl.uniform1f(u(tk, 'uPointScale'), RT.hh * proj[5]);

@@ -72,7 +72,7 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
   (same blur/thickness/composite pipeline); its elongation gain is `?k=`
   (default 1.5, valid 0–4; garbage or out-of-range falls back to the
   default, and `?k=0` looks like `r=ssf`).
-- `?spray=` (0–2, default 1) scales the droplet-spray enhancement: an
+- `?spray=` (also a live panel chip row — changing it must NOT restart the water) (0–2, default 1) scales the droplet-spray enhancement: an
   isolation-gated velocity jitter in G2P (changes the SIM, so every
   renderer sees it) plus isolation-shrunk hash-varied splat radii in
   ssf/aniso/points. `?spray=0` is an exact identity probe — sim and splats

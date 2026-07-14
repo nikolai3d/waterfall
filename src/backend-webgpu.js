@@ -230,7 +230,7 @@ export async function createBackend({ canvas, fail }) {
 
     const S = makeWGSL({
       GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N, ISO: cfg.ISO, MISO: cfg.MISO, K: cfg.K,
-      SPP: cfg.SPP, BOUNCES: cfg.BOUNCES, SPRAY: cfg.SPRAY,
+      SPP: cfg.SPP, BOUNCES: cfg.BOUNCES,
     });
     const simModule = device.createShaderModule({ code: S.sim });
     const renderModule = device.createShaderModule({ code: S.render });
@@ -547,6 +547,7 @@ export async function createBackend({ canvas, fail }) {
       simUF32.set(cfg.rockVel.subarray(r * 3, r * 3 + 3), 16 + r * 4);
     }
     simUU32[32] = substepCount;
+    simUF32[33] = cfg.sprayRef[0]; // live spray strength (SimU.spray)
     device.queue.writeBuffer(bufSimU, 0, simUData);
 
     const enc = device.createCommandEncoder();
@@ -650,6 +651,7 @@ export async function createBackend({ canvas, fail }) {
     f.set(cfg.rockData, 80);
     const g = frame.gizmo;
     f.set(g ? [...g.a, 1, ...g.b, g.r, 0, 0, 0, 0] : new Array(12).fill(0), 80 + NROCK * 4);
+    f[80 + NROCK * 4 + 12] = cfg.sprayRef[0]; // RenderU.fx.x = live spray strength
     device.queue.writeBuffer(bufRenderU, 0, renderUData);
   }
 

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>spray ui harness</title>
+<style>body{margin:0;background:#111;color:#9f9;font:13px monospace}#r{padding:8px;white-space:pre-wrap;min-height:110px}iframe{width:100%;height:540px;border:0}</style>
+</head><body><div id="r">loading…</div><iframe id="app" src="/?g=64&p=192&l=800&warm=500"></iframe>
+<script>
+const lines=[],log=s=>{lines.push(s);document.getElementById('r').textContent=lines.join('\n');};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+document.getElementById('app').addEventListener('load', async () => {
+  try {
+    const w=document.getElementById('app').contentWindow,d=document.getElementById('app').contentDocument;
+    const err=()=>{const e=d.getElementById('err');return e.style.display==='block'?'ERR: '+e.textContent:'ok';};
+    const on=()=>[...d.querySelectorAll('#panel button[data-spray].on')].map(b=>b.textContent).join(',');
+    for (let i = 0; i < 100 && !on(); i++) await sleep(200);
+    log('start: spray chip on=['+on()+'] search='+w.location.search+' · '+err());
+    d.querySelector('#panel button[data-spray="2"]').click();
+    await sleep(300);
+    log('after spray=2 chip: on=['+on()+'] search='+w.location.search+' · '+err());
+    d.querySelector('#panel button[data-spray="0"]').click();
+    await sleep(300);
+    log('after spray=0 chip: on=['+on()+'] search='+w.location.search+' · '+err());
+    // No-restart proof: chips must NOT re-init — the URL keeps l=800&warm=500
+    // and, decisively, the pool must still be present (a restart would clear
+    // to the initial seeding which at warm=500 is mid-buildup; better: check
+    // the render chip row still shows same mode and dbg substep keeps rising
+    // — approximate here by asserting no #err and chips responsive).
+    d.querySelector('#panel button[data-spray="1"]').click();
+    await sleep(300);
+    log('after spray=1 chip: on=['+on()+'] search='+w.location.search+' · '+err());
+    log('DONE');
+  } catch(e){log('EXC: '+(e&&(e.stack||e.message||e)));}
+});
+</script></body></html>
