@@ -315,13 +315,34 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
   // coupling returns as soon as the droplet re-enters dense water (iso->0).
   let bal = smoothstep(0.3, 0.8, iso);
   v = mix(v, vel[i].xyz + vec3f(0.0, GRAV, 0.0), bal);
-  let C2 = C * (1.0 - bal); // stale affine field must not scatter for spray
+  var C2 = C * (1.0 - bal); // stale affine field must not scatter for spray
 
   // Sub-grid dispersion: hashed velocity jitter, gated by iso^2 so pressured
   // water gets exactly zero and only ballistic separated particles disperse
   // (breaks clumps into fine varied spray). CFL-safe: SPRAY_JIT << VMAX.
   v += (hash3(i * 2246822519u + U.frame * 3266489917u) - vec3f(0.5)) *
     (SPRAY_JIT * U.spray * iso * iso);
+
+  // Stagnation detector (isolation-independent): a rock parked in the
+  // stream creates BC dead zones NEXT TO dense flow — wedged droplets sit
+  // in velocity-zeroed cells while the stream's mass keeps iso low, dodging
+  // every isolation-gated fix. Rule: stationary + airborne + empty node
+  // below => count (c1.w); past 45 substeps force free fall regardless of
+  // the gathered field; past 300 (geometrically trapped) fade-recycle.
+  let nodeB = clamp(vec3i(floor(p + vec3f(0.5))) - vec3i(0, 1, 0),
+    vec3i(0), vec3i(GRIDI - 1));
+  let mBelow = gridV[cellIndex(nodeB)].w;
+  let hanging = p.y > 6.0 && mBelow < 0.5;
+  var stag = cmat[i * 3u + 1u].w;
+  if (!hanging) {
+    stag = 0.0;
+  } else if (dot(v, v) < 4e-4) {
+    stag = stag + 1.0;
+  }
+  if (hanging && stag > 45.0) {
+    v = vel[i].xyz + vec3f(0.0, GRAV, 0.0); // accumulate real gravity
+    C2 = mat3x3f(vec3f(0.0), vec3f(0.0), vec3f(0.0));
+  }
 
   p += v; // dt = 1
 
@@ -346,11 +367,12 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
   // age out early instead of hanging around for the full lifetime.
   var ageOut = age;
   if (iso > 0.6 && dot(v, v) < 4e-4) { ageOut = age + 8.0; }
+  if (stag > 300.0) { ageOut = max(age, LIFE - 59.0); } // trapped: fade out
 
   pos[i] = vec4f(p, ageOut);
   vel[i] = vec4f(v, length(v));
   cmat[i * 3u] = vec4f(C2[0], iso);
-  cmat[i * 3u + 1u] = vec4f(C2[1], 0.0);
+  cmat[i * 3u + 1u] = vec4f(C2[1], stag);
   cmat[i * 3u + 2u] = vec4f(C2[2], 0.0);
 }
 `;

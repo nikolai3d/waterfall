@@ -10,7 +10,7 @@ No test suite; the only end-to-end check is running the app and looking at it.
 ## Serve + screenshot
 
 ```sh
-python3 -m http.server 8123   # in the repo root; ES modules need http
+python3 serve.py   # repo-root dev server: threaded + no-store (required)
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --headless=new --no-first-run --window-size=900,650 \
   --screenshot=out.png --virtual-time-budget=4000 \
@@ -95,8 +95,7 @@ a sim bug or a render bug?" questions, read particle state directly in a
 real-time harness: `await __wf.backend.readParticles()` (pos+age) twice a
 few seconds apart finds stuck/hovering particles by displacement;
 `readC()` (WebGPU) returns the C-matrix buffer incl. the isolation signal
-in `[i*12+3]`. NOTE: the dev server must send no-store headers (see
-scratchpad nocache_server.py) — the plain `python3 -m http.server` lets
+in `[i*12+3]`. NOTE: the dev server must send no-store headers (use the repo's serve.py) — the plain `python3 -m http.server` lets
 Chrome heuristically cache modules, so a user's tab can silently test
 STALE code while fresh headless profiles test new code.
 

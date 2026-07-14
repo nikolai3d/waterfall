@@ -290,6 +290,7 @@ export async function createBackend({ canvas, fail }) {
     bindTex(0, cur.pos, progG2P, 'uPos');
     bindTex(1, gridB, progG2P, 'uGrid');
     bindTex(4, cur.vel, progG2P, 'uVel'); // ballistic spray reads previous velocity
+    bindTex(5, cur.c1, progG2P, 'uC1');  // stagnation counter in .w
     bindTex(2, densTex, progG2P, 'uAux');
     bindTex(3, cur.c0, progG2P, 'uC0');
     gl.uniform4fv(u(progG2P, 'uRocks'), cfg.rockData);

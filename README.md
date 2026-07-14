@@ -17,9 +17,13 @@ the same family of methods behind most modern real-time fluid demos.
 Any static file server works (ES modules require http):
 
 ```sh
-python3 -m http.server 8123
+python3 serve.py   # threaded, no-store — always serves current code
 # then open http://localhost:8123
 ```
+
+(Any static server works, but `python3 -m http.server` lets the browser
+cache the JS modules, so after editing shaders a tab can silently keep
+running stale code.)
 
 Controls: **drag a rock** to move it (the water is pushed aside as it goes),
 **drag** elsewhere to orbit, **wheel** to zoom, **space** to pause,

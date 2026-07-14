@@ -278,7 +278,7 @@ void main() {
 
   // G2P: gather velocity and affine matrix C, advect, handle spawning.
   const fsG2P = header + `
-uniform sampler2D uPos, uGrid, uAux, uC0, uVel;
+uniform sampler2D uPos, uGrid, uAux, uC0, uC1, uVel;
 uniform float uFrame;
 layout(location = 0) out vec4 oPos;
 layout(location = 1) out vec4 oVel;
@@ -360,6 +360,24 @@ void main() {
   v += (hash3(uint(pid) * 2246822519u + uint(uFrame) * 3266489917u) - 0.5) *
     (SPRAY_JIT * uSpray * iso * iso);
 
+  // Stagnation detector (isolation-independent): a rock parked in the
+  // stream creates BC dead zones NEXT TO dense flow — wedged droplets sit
+  // in velocity-zeroed cells while the stream's mass keeps iso low, dodging
+  // every isolation-gated fix. Rule: stationary + airborne + empty node
+  // below => count (c1.w); past 45 substeps force free fall regardless of
+  // the gathered field; past 300 (geometrically trapped) fade-recycle.
+  ivec3 nodeB = clamp(ivec3(floor(p + 0.5)) - ivec3(0, 1, 0),
+    ivec3(0), ivec3(GRIDI - 1));
+  float mBelow = gridFetch(uGrid, nodeB).w;
+  bool hanging = p.y > 6.0 && mBelow < 0.5;
+  float stag = texelFetch(uC1, pt, 0).w;
+  if (!hanging) stag = 0.0;
+  else if (dot(v, v) < 4e-4) stag = stag + 1.0;
+  if (hanging && stag > 45.0) {
+    v = texelFetch(uVel, pt, 0).xyz + vec3(0.0, GRAV, 0.0); // real gravity
+    C = mat3(0.0);
+  }
+
   p += v; // dt = 1
 
   float sd = sdRocks(p);
@@ -383,11 +401,12 @@ void main() {
   // age out early instead of hanging around for the full lifetime.
   float ageOut = age;
   if (iso > 0.6 && dot(v, v) < 4e-4) ageOut = age + 8.0;
+  if (stag > 300.0) ageOut = max(age, LIFE - 59.0); // trapped: fade out
 
   oPos = vec4(p, ageOut);
   oVel = vec4(v, length(v));
   oC0 = vec4(C[0], iso);
-  oC1 = vec4(C[1], 0.0);
+  oC1 = vec4(C[1], stag);
   oC2 = vec4(C[2], 0.0);
 }
 `;
