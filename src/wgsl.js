@@ -10,7 +10,7 @@ import { MC_ROW, MC_CAP, MC_CORNERS, MC_EDGES } from './mctables.js';
 
 export function makeWGSL(opts) {
   // ISO/K/SPP/BOUNCES are validated/defaulted in app.js.
-  const { GRID, LIFE, N, ISO, K, SPP = 1, BOUNCES = 4 } = opts;
+  const { GRID, LIFE, N, ISO, MISO, K, SPP = 1, BOUNCES = 4 } = opts;
   const s = GRID / 64;
   const vec3f = (a) => `vec3f(${a.map((v) => v.toFixed(2)).join(', ')})`;
   const NROCK = ROCKS.length;
@@ -1335,7 +1335,7 @@ fn fsVoxel(@builtin(position) frag: vec4f) -> @location(0) vec4f {
   // clamps its vertex count to the pool cap (overflowing cells skip whole
   // triangles past the cap, so no partial triangles).
   const mcCompute = common + `
-const MISO: f32 = ${ISO.toFixed(4)};   // iso threshold (?iso=, shared with voxel)
+const MISO: f32 = ${MISO.toFixed(4)};  // iso (default 0.5 = volume/trace parity; ?iso= overrides)
 const MCCAP: u32 = ${MC_CAP}u;         // vertex pool cap
 const MCROW: i32 = ${MC_ROW};          // triangle-table row stride
 

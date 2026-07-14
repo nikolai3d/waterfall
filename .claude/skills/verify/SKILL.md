@@ -31,7 +31,7 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
 - `?r=points` exercises the legacy impostor render path; `?r=volume` the
   grid-density raymarcher; `?r=voxel` the grid-aligned-cube DDA renderer.
   Both volume and voxel render offscreen at `?rscale=` (default 0.5, valid
-  0.1–1). The `?iso=` density threshold (default 1.5, valid 0.1–16; garbage
+  0.1–1). The `?iso=` density threshold (defaults: voxel 1.5, mesh 0.5; valid 0.1–16; garbage
   or out-of-range falls back to the default) drives both voxel's solid
   cells and the mesh renderer's isosurface.
 - `?r=mesh` is the marching-cubes isosurface mesh — WebGPU only: on WebGL2

@@ -173,7 +173,7 @@ sim advances — the freshly rebuilt grid is empty until the first substep.
 | `warm` | 0          | substeps to pre-simulate before the first frame    |
 | `r`    | `ssf`      | rendering: `ssf` (water surface), `points`, `volume`, `voxel`, `aniso`, `mesh`/`trace` (WebGPU only) |
 | `rscale`| 0.5       | offscreen target scale for `r=volume`/`r=voxel`/`r=trace` (0.1–1) |
-| `iso`  | 1.5        | density threshold for `r=voxel` cells and the `r=mesh` isosurface (0.1–16) |
+| `iso`  | 1.5 / 0.5  | density threshold, voxel / mesh defaults; setting it drives both (0.1–16) |
 | `k`    | 1.5        | splat elongation gain for `r=aniso` (0–4)          |
 | `spp`  | 1          | paths traced per pixel per frame for `r=trace` (1–8) |
 | `bounces`| 4        | maximum path depth for `r=trace` (1–8)             |

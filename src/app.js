@@ -26,6 +26,10 @@ if (!(RSCALE >= 0.1 && RSCALE <= 1)) RSCALE = 0.5;
 // sweet spot; garbage or out-of-range values fall back to the default.
 let ISO = parseFloat(params.get('iso') || '1.5');
 if (!(ISO >= 0.1 && ISO <= 16)) ISO = 1.5;
+// Mesh surfaces at the volume/trace threshold by default (0.5) so strands
+// and droplets read as thick as the other modes; voxel keeps 1.5 (chunky
+// look needs mostly-full cells). An explicit ?iso= drives both.
+const MISO = params.has('iso') ? ISO : 0.5;
 
 // Aniso renderer elongation gain (?k=): splats stretch along velocity by
 // 1 + k*min(speed/VMAX, 1). Clamped to 0..4 so fast splash particles don't
@@ -149,7 +153,7 @@ function initialParticleData() {
 function config() {
   N = PTEX * PTEX;
   updateRockData();
-  return { GRID, PTEX, LIFE, N, RSCALE, ISO, K, SPP, BOUNCES, initialData: initialParticleData(), rockData, rockVel };
+  return { GRID, PTEX, LIFE, N, RSCALE, ISO, MISO, K, SPP, BOUNCES, initialData: initialParticleData(), rockData, rockVel };
 }
 
 backend.init(config());
@@ -570,7 +574,8 @@ function tick(now) {
     statsEl.textContent =
       `${fps.toFixed(0)} fps · ${N.toLocaleString()} particles · ${GRID}³ grid · ${SUBSTEPS} substeps · ${modeToken}` +
       (eff === 'volume' || eff === 'voxel' || eff === 'trace' ? ` rscale=${RSCALE}` : '') +
-      (eff === 'voxel' || eff === 'mesh' ? ` iso=${ISO}` : '') +
+      (eff === 'voxel' ? ` iso=${ISO}` : '') +
+      (eff === 'mesh' ? ` iso=${MISO}` : '') +
       (eff === 'aniso' ? ` k=${K}` : '') +
       (eff === 'trace' ? ` spp=${accFrames * SPP} (x${SPP}) bounces=${BOUNCES}` : '') + ` · ${backendLabel}` +
       (paused ? ' · paused' : '');

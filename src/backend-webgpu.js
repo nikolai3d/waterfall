@@ -224,7 +224,7 @@ export async function createBackend({ canvas, fail }) {
     NCELL = cfg.GRID ** 3;
 
     const S = makeWGSL({
-      GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N, ISO: cfg.ISO, K: cfg.K,
+      GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N, ISO: cfg.ISO, MISO: cfg.MISO, K: cfg.K,
       SPP: cfg.SPP, BOUNCES: cfg.BOUNCES,
     });
     const simModule = device.createShaderModule({ code: S.sim });
