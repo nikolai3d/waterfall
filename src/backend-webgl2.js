@@ -150,7 +150,7 @@ export async function createBackend({ canvas, fail }) {
     cfg = config;
     GTEX = gridLayout(cfg.GRID).GTEX;
 
-    const S = makeShaders({ GRID: cfg.GRID, PTEX: cfg.PTEX, LIFE: cfg.LIFE, ISO: cfg.ISO, K: cfg.K });
+    const S = makeShaders({ GRID: cfg.GRID, PTEX: cfg.PTEX, LIFE: cfg.LIFE, ISO: cfg.ISO, K: cfg.K, SPRAY: cfg.SPRAY });
     progP2G1 = compile(S.vsP2G1, S.fsScatter, 'p2g1');
     progP2G2 = compile(S.vsP2G2, S.fsScatter, 'p2g2');
     progDensity = compile(S.vsQuad, S.fsDensity, 'density');
@@ -281,12 +281,16 @@ export async function createBackend({ canvas, fail }) {
     gl.uniform3fv(u(progGrid, 'uRockVel'), cfg.rockVel);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-    // 5. G2P + advect
+    // 5. G2P + advect. densTex (this substep's density pass, uAux) and
+    // cur.c0 (previous iso in .w, uC0) feed the spray isolation signal;
+    // neither is attached to nxt.fbo, so there is no FBO feedback.
     gl.bindFramebuffer(gl.FRAMEBUFFER, nxt.fbo);
     gl.viewport(0, 0, cfg.PTEX, cfg.PTEX);
     gl.useProgram(progG2P);
     bindTex(0, cur.pos, progG2P, 'uPos');
     bindTex(1, gridB, progG2P, 'uGrid');
+    bindTex(2, densTex, progG2P, 'uAux');
+    bindTex(3, cur.c0, progG2P, 'uC0');
     gl.uniform4fv(u(progG2P, 'uRocks'), cfg.rockData);
     gl.uniform1f(u(progG2P, 'uFrame'), substepCount);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -391,6 +395,7 @@ export async function createBackend({ canvas, fail }) {
       gl.useProgram(progPoints);
       bindTex(0, cur.pos, progPoints, 'uPos');
       bindTex(1, cur.vel, progPoints, 'uVel');
+      bindTex(2, cur.c0, progPoints, 'uC0'); // isolation in .w (spray shrink)
       gl.uniformMatrix4fv(u(progPoints, 'uProj'), false, proj);
       gl.uniformMatrix4fv(u(progPoints, 'uView'), false, view);
       gl.uniform1f(u(progPoints, 'uPointScale'), h * proj[5]);
@@ -420,6 +425,7 @@ export async function createBackend({ canvas, fail }) {
     gl.useProgram(pd);
     bindTex(0, cur.pos, pd, 'uPos');
     bindTex(1, cur.vel, pd, 'uVel');
+    bindTex(2, cur.c0, pd, 'uC0'); // isolation in .w (spray shrink)
     gl.uniformMatrix4fv(u(pd, 'uProj'), false, proj);
     gl.uniformMatrix4fv(u(pd, 'uView'), false, view);
     gl.uniform1f(u(pd, 'uPointScale'), h * proj[5]);
@@ -457,6 +463,7 @@ export async function createBackend({ canvas, fail }) {
     // pool behind, while pixels between sparse droplets keep their pool
     // contribution (the blurred depth's near-clamped halo would fake holes).
     bindTex(2, RT.waterDepth, tk, 'uFront');
+    bindTex(3, cur.c0, tk, 'uC0'); // isolation in .w (spray shrink)
     gl.uniformMatrix4fv(u(tk, 'uProj'), false, proj);
     gl.uniformMatrix4fv(u(tk, 'uView'), false, view);
     gl.uniform1f(u(tk, 'uPointScale'), RT.hh * proj[5]);

@@ -23,7 +23,7 @@ export function gridLayout(GRID) {
 }
 
 export function makeShaders(opts) {
-  const { GRID, PTEX, LIFE, ISO, K } = opts; // ISO/K validated/defaulted in app.js
+  const { GRID, PTEX, LIFE, ISO, K, SPRAY = 1 } = opts; // ISO/K/SPRAY validated/defaulted in app.js
   const { TILES, GTEX } = gridLayout(GRID);
   const s = GRID / 64;
   const vec3 = (a) => `vec3(${a.map((v) => v.toFixed(2)).join(', ')})`;
@@ -53,6 +53,8 @@ const vec3 EMIT_R = ${vec3([2 * s, 1.5 * s, 13 * s])};  // spout extent (a wide 
 const vec3 EMIT_V = vec3(0.10, -0.05, 0.0);  // initial jet velocity
 
 const float PRADIUS = 0.021;     // particle render radius, world units
+const float SPRAY = ${SPRAY.toFixed(4)}; // ?spray= strength (0 disables jitter + shrink exactly)
+const float SPRAY_JIT = 0.06;    // dispersion jitter at iso = 1, cells/substep
 
 const int NROCK = ${ROCKS.length};
 uniform vec4 uRocks[NROCK]; // xyz center + radius, grid units (draggable)
@@ -100,6 +102,15 @@ vec3 hash3(uint n) {
 
 float hash1(vec3 p) {
   return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+
+// Effective splat radius: isolated particles (spray droplets) shrink by an
+// isolation-weighted, per-particle-hashed factor so spray reads as fine and
+// size-varied instead of uniform spheres. Dense water (iso = 0) and
+// SPRAY = 0 keep exactly PRADIUS. Mirrors splatRadius in wgsl.js.
+float sprayRadius(float iso, uint pid) {
+  float h = hash3(pid * 1597334677u).x;
+  return PRADIUS * clamp(1.0 - SPRAY * iso * (0.62 - 0.30 * h), 0.15, 1.0);
 }
 `;
 
@@ -263,7 +274,7 @@ void main() {
 
   // G2P: gather velocity and affine matrix C, advect, handle spawning.
   const fsG2P = header + `
-uniform sampler2D uPos, uGrid;
+uniform sampler2D uPos, uGrid, uAux, uC0;
 uniform float uFrame;
 layout(location = 0) out vec4 oPos;
 layout(location = 1) out vec4 oVel;
@@ -311,6 +322,19 @@ void main() {
   }
   mat3 C = 4.0 * B;
 
+  // Isolation signal (stored in oC0.w, which P2G never reads): 0 in dense
+  // water, ->1 for lone spray droplets. Instantaneous value from this
+  // substep's density pass, temporally smoothed against popping, spawn-age
+  // guarded so the deliberately dense fresh spout stream can't flicker.
+  float isoI = clamp(1.0 - texelFetch(uAux, pt, 0).x / (0.5 * REST), 0.0, 1.0);
+  float iso = mix(texelFetch(uC0, pt, 0).w, isoI, 0.15) * clamp(age / 30.0, 0.0, 1.0);
+
+  // Sub-grid dispersion: hashed velocity jitter, gated by iso^2 so pressured
+  // water gets exactly zero and only ballistic separated particles disperse
+  // (breaks clumps into fine varied spray). CFL-safe: SPRAY_JIT << VMAX.
+  v += (hash3(uint(pid) * 2246822519u + uint(uFrame) * 3266489917u) - 0.5) *
+    (SPRAY_JIT * SPRAY * iso * iso);
+
   p += v; // dt = 1
 
   float sd = sdRocks(p);
@@ -324,7 +348,7 @@ void main() {
 
   oPos = vec4(p, age);
   oVel = vec4(v, length(v));
-  oC0 = vec4(C[0], 0.0);
+  oC0 = vec4(C[0], iso);
   oC1 = vec4(C[1], 0.0);
   oC2 = vec4(C[2], 0.0);
 }
@@ -332,23 +356,26 @@ void main() {
 
   // Water particles as shaded sphere impostors.
   const vsPoint = header + `
-uniform sampler2D uPos, uVel;
+uniform sampler2D uPos, uVel, uC0;
 uniform mat4 uProj, uView;
 uniform float uPointScale;
 flat out vec3 vCenterV;
 flat out float vSpeed;
+flat out float vPr;
 
 void main() {
   ivec2 pt = ivec2(gl_VertexID % PTEX, gl_VertexID / PTEX);
   vec4 pa = texelFetch(uPos, pt, 0);
-  if (pa.w < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vCenterV = vec3(0.0); vSpeed = 0.0; return; }
+  if (pa.w < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vCenterV = vec3(0.0); vSpeed = 0.0; vPr = 0.0; return; }
 
+  float pr = sprayRadius(texelFetch(uC0, pt, 0).w, uint(gl_VertexID));
   vec3 wp = pa.xyz * (2.0 / GRIDF) - 1.0;
   vec4 vp = uView * vec4(wp, 1.0);
   gl_Position = uProj * vp;
-  gl_PointSize = clamp(uPointScale * PRADIUS / max(-vp.z, 0.05), 1.0, 96.0);
+  gl_PointSize = clamp(uPointScale * pr / max(-vp.z, 0.05), 1.0, 96.0);
   vCenterV = vp.xyz;
   vSpeed = texelFetch(uVel, pt, 0).w / VMAX;
+  vPr = pr;
 }
 `;
 
@@ -357,6 +384,7 @@ uniform mat4 uProj;
 uniform vec3 uLightV; // light direction in view space
 flat in vec3 vCenterV;
 flat in float vSpeed;
+flat in float vPr;
 out vec4 o;
 
 void main() {
@@ -367,7 +395,7 @@ void main() {
   float z = sqrt(1.0 - r2);
   vec3 n = vec3(q, z);
 
-  vec3 fp = vCenterV + n * PRADIUS;
+  vec3 fp = vCenterV + n * vPr;
   vec4 clip = uProj * vec4(fp, 1.0);
   gl_FragDepth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
 
@@ -395,6 +423,7 @@ void main() {
 uniform mat4 uProj;
 flat in vec3 vCenterV;
 flat in float vSpeed;
+flat in float vPr;
 out vec4 o;
 
 void main() {
@@ -402,7 +431,7 @@ void main() {
   q.y = -q.y;
   float r2 = dot(q, q);
   if (r2 > 1.0) discard;
-  vec3 fp = vCenterV + vec3(q, sqrt(1.0 - r2)) * PRADIUS;
+  vec3 fp = vCenterV + vec3(q, sqrt(1.0 - r2)) * vPr;
   vec4 clip = uProj * vec4(fp, 1.0);
   gl_FragDepth = clamp(clip.z / clip.w * 0.5 + 0.5, 0.0, 1.0);
   o = vec4(-fp.z, 0.0, 0.0, 1.0);
@@ -412,22 +441,25 @@ void main() {
   // Thickness pass: soft additive sprites into a half-res RG target.
   // R = thickness, G = speed-weighted thickness (average speed -> foam).
   const vsThick = header + `
-uniform sampler2D uPos, uVel;
+uniform sampler2D uPos, uVel, uC0;
 uniform mat4 uProj, uView;
 uniform float uPointScale;
 flat out float vSpeed;
 flat out float vZ;
+flat out float vPr;
 
 void main() {
   ivec2 pt = ivec2(gl_VertexID % PTEX, gl_VertexID / PTEX);
   vec4 pa = texelFetch(uPos, pt, 0);
-  if (pa.w < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vSpeed = 0.0; vZ = 0.0; return; }
+  if (pa.w < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); gl_PointSize = 1.0; vSpeed = 0.0; vZ = 0.0; vPr = 0.0; return; }
+  float pr = sprayRadius(texelFetch(uC0, pt, 0).w, uint(gl_VertexID));
   vec3 wp = pa.xyz * (2.0 / GRIDF) - 1.0;
   vec4 vp = uView * vec4(wp, 1.0);
   gl_Position = uProj * vp;
-  gl_PointSize = clamp(uPointScale * PRADIUS * ${THICK_MUL.toFixed(4)} / max(-vp.z, 0.05), 1.0, 96.0);
+  gl_PointSize = clamp(uPointScale * pr * ${THICK_MUL.toFixed(4)} / max(-vp.z, 0.05), 1.0, 96.0);
   vSpeed = texelFetch(uVel, pt, 0).w / VMAX;
   vZ = -vp.z;
+  vPr = pr;
 }
 `;
 
@@ -435,6 +467,7 @@ void main() {
 uniform sampler2D uFront; // smoothed water surface depth, full resolution
 flat in float vSpeed;
 flat in float vZ;
+flat in float vPr;
 out vec4 o;
 
 void main() {
@@ -452,8 +485,9 @@ void main() {
   // (R, G) — culling it entirely would fade the composite to the
   // background wherever the near water is sparse (fake holes).
   float keep = (front > 0.0 && vZ > front + 0.3) ? 0.0 : 1.0;
+  // Amplitude follows the effective radius so shrunken droplets absorb less.
   float f = 1.0 - r2;
-  float th = f * f * PRADIUS * 2.0;
+  float th = f * f * vPr * 2.0;
   o = vec4(th * keep, th * vSpeed * keep, th, 1.0);
 }
 `;
@@ -477,7 +511,7 @@ const float THICK_MUL = ${THICK_MUL.toFixed(4)};  // thickness footprint (shared
   // Two VS variants are generated (like the WGSL entry points): the depth
   // pass at the plain radius, the thickness pass at the THICK_MUL footprint.
   const makeVsAniso = (sizeMul) => header + anisoConsts + `
-uniform sampler2D uPos, uVel;
+uniform sampler2D uPos, uVel, uC0;
 uniform mat4 uProj, uView;
 uniform float uPointScale;
 const float SIZE_MUL = ${sizeMul.toFixed(4)}; // 1.0 for depth, THICK_MUL for thickness
@@ -511,8 +545,11 @@ void main() {
   vec3 refv = abs(axis.y) > 0.9 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
   vec3 m1 = normalize(cross(axis, refv));
   vec3 m2 = cross(axis, m1);
-  float ra = PRADIUS * elong * SIZE_MUL;              // major semi-axis
-  float rb = PRADIUS * inversesqrt(elong) * SIZE_MUL; // minors conserve volume
+  // Spray shrink scales both semi-axes; the thickness amplitude follows via
+  // its existing 2/|qz| footprint normalization (no extra plumbing needed).
+  float pr = sprayRadius(texelFetch(uC0, pt, 0).w, uint(gl_VertexID));
+  float ra = pr * elong * SIZE_MUL;              // major semi-axis
+  float rb = pr * inversesqrt(elong) * SIZE_MUL; // minors conserve volume
 
   // Conservative sprite: exact orthographic extents of the projected
   // ellipse per screen axis (row norms of the semi-axis matrix).

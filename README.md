@@ -91,6 +91,17 @@ blur, thickness accumulation, occlusion, and composite stages are shared
 with `ssf` unchanged; `?k=0` reduces to the spherical splats (matching them
 exactly wherever the 1–96 px sprite-size clamp is inactive).
 
+Separated water gets a **droplet spray** treatment (`?spray=`, 0–2, default
+1): the sim derives a per-particle isolation signal from its density pass
+(0 in pressured water, →1 for lone droplets, temporally smoothed and
+spawn-age guarded), applies an isolation-gated velocity jitter in G2P so
+flying clumps disperse into finer spray — which every renderer benefits
+from, grid modes included — and the `ssf`/`aniso`/`points` splats shrink
+isolated particles by an isolation-weighted per-particle-hashed factor
+(with the thickness amplitude following), so spray reads as fine,
+size-varied droplets instead of uniform spheres. `?spray=0` disables both
+effects exactly; the stats line shows `spray=N` when it isn't 1.
+
 `?r=volume` instead raymarches the simulation's own density grid as a true
 3D volume: a fragment shader marches the (tent-blurred) grid mass to an
 iso-surface, refines the hit by bisection, shades with a density-gradient
@@ -175,6 +186,7 @@ sim advances — the freshly rebuilt grid is empty until the first substep.
 | `rscale`| 0.5       | offscreen target scale for `r=volume`/`r=voxel`/`r=trace` (0.1–1) |
 | `iso`  | 1.5 / 0.5  | density threshold, voxel / mesh defaults; setting it drives both (0.1–16) |
 | `k`    | 1.5        | splat elongation gain for `r=aniso` (0–4)          |
+| `spray`| 1          | droplet spray strength: sim dispersion jitter + splat shrink (0–2; 0 = off exactly) |
 | `spp`  | 1          | paths traced per pixel per frame for `r=trace` (1–8) |
 | `bounces`| 4        | maximum path depth for `r=trace` (1–8)             |
 | `api`  | auto       | backend: `webgpu` or `webgl2` (auto-detects)       |

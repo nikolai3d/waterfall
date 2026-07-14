@@ -72,9 +72,19 @@ python3 -m http.server 8123   # in the repo root; ES modules need http
   (same blur/thickness/composite pipeline); its elongation gain is `?k=`
   (default 1.5, valid 0–4; garbage or out-of-range falls back to the
   default, and `?k=0` looks like `r=ssf`).
+- `?spray=` (0–2, default 1) scales the droplet-spray enhancement: an
+  isolation-gated velocity jitter in G2P (changes the SIM, so every
+  renderer sees it) plus isolation-shrunk hash-varied splat radii in
+  ssf/aniso/points. `?spray=0` is an exact identity probe — sim and splats
+  must look like the pre-spray build. Garbage (`?spray=banana`) or
+  out-of-range falls back to the default 1, and because the ` spray=N`
+  stats token is shown only when N ≠ 1, the garbage probe asserts the
+  ABSENCE of a spray token (plus default-looking rendering), never
+  ` spray=1`; `spray=0` and `spray=2` do show their tokens.
 - The stats line shows the active render mode (and, in volume/voxel/trace
   modes, the effective `rscale=`; in voxel and mesh modes also `iso=`; in
-  aniso mode `k=`; in trace mode the accumulated `spp=N (xM) bounces=K`) —
+  aniso mode `k=`; in trace mode the accumulated `spp=N (xM) bounces=K`;
+  in any mode ` spray=N` when `?spray=` ≠ 1) —
   assert on it in harnesses to confirm a mode/param took effect.
 - macOS has no `timeout` command.
 

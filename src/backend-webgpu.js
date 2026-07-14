@@ -65,6 +65,10 @@ export async function createBackend({ canvas, fail }) {
       { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
       { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+      // cmat: the splat VS reads the isolation signal (spray shrink) from
+      // cmat[3i].w. Binding 3 is skipped — it is fsThick's depth texture,
+      // present only in thickLayout; matching indices keep one WGSL module.
+      { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
     ],
   });
   // The thickness pass additionally reads the raw water depth for occlusion;
@@ -76,6 +80,7 @@ export async function createBackend({ canvas, fail }) {
       { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
       { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } },
+      { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }, // cmat
     ],
   });
   const blurLayout = device.createBindGroupLayout({
@@ -225,7 +230,7 @@ export async function createBackend({ canvas, fail }) {
 
     const S = makeWGSL({
       GRID: cfg.GRID, LIFE: cfg.LIFE, N: cfg.N, ISO: cfg.ISO, MISO: cfg.MISO, K: cfg.K,
-      SPP: cfg.SPP, BOUNCES: cfg.BOUNCES,
+      SPP: cfg.SPP, BOUNCES: cfg.BOUNCES, SPRAY: cfg.SPRAY,
     });
     const simModule = device.createShaderModule({ code: S.sim });
     const renderModule = device.createShaderModule({ code: S.render });
@@ -516,6 +521,7 @@ export async function createBackend({ canvas, fail }) {
         { binding: 0, resource: { buffer: bufRenderU } },
         { binding: 1, resource: { buffer: bufPos } },
         { binding: 2, resource: { buffer: bufVel } },
+        { binding: 4, resource: { buffer: bufC } },
       ],
     });
     if (!RT) return;
@@ -526,6 +532,7 @@ export async function createBackend({ canvas, fail }) {
         { binding: 1, resource: { buffer: bufPos } },
         { binding: 2, resource: { buffer: bufVel } },
         { binding: 3, resource: RT.v.waterDepth },
+        { binding: 4, resource: { buffer: bufC } },
       ],
     });
   }

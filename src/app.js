@@ -45,6 +45,14 @@ if (!(SPP >= 1 && SPP <= 8)) SPP = 1;
 let BOUNCES = parseInt(params.get('bounces') || '4', 10);
 if (!(BOUNCES >= 1 && BOUNCES <= 8)) BOUNCES = 4;
 
+// Droplet spray strength (?spray=), baked into both shader headers: scales
+// BOTH the isolation-gated velocity jitter in G2P (all renderers benefit)
+// and the isolation-shrunk splat radii (ssf/aniso/points/thickness). 0
+// disables the effect exactly (identity with the no-spray look); garbage or
+// out-of-range values fall back to the default 1.
+let SPRAY = parseFloat(params.get('spray') || '1');
+if (!(SPRAY >= 0 && SPRAY <= 2)) SPRAY = 1;
+
 // The CFL clamp caps velocity in cells/substep, so finer grids need more
 // substeps per frame to move at the same world-space speed.
 const defaultSubsteps = () => Math.max(1, Math.round(GRID / 32));
@@ -153,7 +161,7 @@ function initialParticleData() {
 function config() {
   N = PTEX * PTEX;
   updateRockData();
-  return { GRID, PTEX, LIFE, N, RSCALE, ISO, MISO, K, SPP, BOUNCES, initialData: initialParticleData(), rockData, rockVel };
+  return { GRID, PTEX, LIFE, N, RSCALE, ISO, MISO, K, SPP, BOUNCES, SPRAY, initialData: initialParticleData(), rockData, rockVel };
 }
 
 backend.init(config());
@@ -577,7 +585,8 @@ function tick(now) {
       (eff === 'voxel' ? ` iso=${ISO}` : '') +
       (eff === 'mesh' ? ` iso=${MISO}` : '') +
       (eff === 'aniso' ? ` k=${K}` : '') +
-      (eff === 'trace' ? ` spp=${accFrames * SPP} (x${SPP}) bounces=${BOUNCES}` : '') + ` · ${backendLabel}` +
+      (eff === 'trace' ? ` spp=${accFrames * SPP} (x${SPP}) bounces=${BOUNCES}` : '') +
+      (SPRAY !== 1 ? ` spray=${SPRAY}` : '') + ` · ${backendLabel}` +
       (paused ? ' · paused' : '');
     frames = 0;
     lastFps = now;

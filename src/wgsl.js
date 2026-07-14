@@ -9,8 +9,8 @@ import { ROCKS, THICK_MUL, ANISO_AGE } from './shaders.js';
 import { MC_ROW, MC_CAP, MC_CORNERS, MC_EDGES } from './mctables.js';
 
 export function makeWGSL(opts) {
-  // ISO/K/SPP/BOUNCES are validated/defaulted in app.js.
-  const { GRID, LIFE, N, ISO, MISO, K, SPP = 1, BOUNCES = 4 } = opts;
+  // ISO/K/SPP/BOUNCES/SPRAY are validated/defaulted in app.js.
+  const { GRID, LIFE, N, ISO, MISO, K, SPP = 1, BOUNCES = 4, SPRAY = 1 } = opts;
   const s = GRID / 64;
   const vec3f = (a) => `vec3f(${a.map((v) => v.toFixed(2)).join(', ')})`;
   const NROCK = ROCKS.length;
@@ -35,6 +35,8 @@ const EMIT_R: vec3f = ${vec3f([2 * s, 1.5 * s, 13 * s])};  // spout extent
 const EMIT_V: vec3f = vec3f(0.10, -0.05, 0.0);             // initial jet velocity
 
 const PRADIUS: f32 = 0.021; // particle render radius, world units
+const SPRAY: f32 = ${SPRAY.toFixed(4)}; // ?spray= strength (0 disables jitter + shrink exactly)
+const SPRAY_JIT: f32 = 0.06;            // dispersion jitter at iso = 1, cells/substep
 const NROCK: i32 = ${NROCK};
 const FX: f32 = 65536.0;    // fixed-point scale for grid atomics
 const B: f32 = ${(1 - 4 / GRID).toFixed(6)}; // wall extent, world units (cells 2..GRIDI-2)
@@ -286,6 +288,19 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
   }
   let C = Bm * 4.0;
 
+  // Isolation signal (stored in cmat[0].w, which P2G never reads): 0 in
+  // dense water, ->1 for lone spray droplets. Instantaneous value from this
+  // substep's density pass, temporally smoothed against popping, spawn-age
+  // guarded so the deliberately dense fresh spout stream can't flicker.
+  let isoI = clamp(1.0 - aux[i].x / (0.5 * REST), 0.0, 1.0);
+  let iso = mix(cmat[i * 3u].w, isoI, 0.15) * clamp(age / 30.0, 0.0, 1.0);
+
+  // Sub-grid dispersion: hashed velocity jitter, gated by iso^2 so pressured
+  // water gets exactly zero and only ballistic separated particles disperse
+  // (breaks clumps into fine varied spray). CFL-safe: SPRAY_JIT << VMAX.
+  v += (hash3(i * 2246822519u + U.frame * 3266489917u) - vec3f(0.5)) *
+    (SPRAY_JIT * SPRAY * iso * iso);
+
   p += v; // dt = 1
 
   let sd = sdRocks(p);
@@ -299,7 +314,7 @@ fn g2p(@builtin(global_invocation_id) gid: vec3u) {
 
   pos[i] = vec4f(p, age);
   vel[i] = vec4f(v, length(v));
-  cmat[i * 3u] = vec4f(C[0], 0.0);
+  cmat[i * 3u] = vec4f(C[0], iso);
   cmat[i * 3u + 1u] = vec4f(C[1], 0.0);
   cmat[i * 3u + 2u] = vec4f(C[2], 0.0);
 }
@@ -332,6 +347,17 @@ struct RenderU {
 @group(0) @binding(1) var<storage, read> pos: array<vec4f>;
 @group(0) @binding(2) var<storage, read> vel: array<vec4f>;
 @group(0) @binding(3) var frontTex: texture_2d<f32>; // raw water depth (fsThick only)
+@group(0) @binding(4) var<storage, read> cmat: array<vec4f>; // cmat[3i].w = isolation
+
+// Effective splat radius: isolated particles (spray droplets) shrink by an
+// isolation-weighted, per-particle-hashed factor so spray reads as fine and
+// size-varied instead of uniform spheres. Dense water (iso = 0) and
+// SPRAY = 0 keep exactly PRADIUS.
+fn splatRadius(ii: u32) -> f32 {
+  let iso = cmat[ii * 3u].w;
+  let h = hash3(ii * 1597334677u).x;
+  return PRADIUS * clamp(1.0 - SPRAY * iso * (0.62 - 0.30 * h), 0.15, 1.0);
+}
 
 @vertex
 fn vsFull(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
@@ -499,6 +525,7 @@ struct PointVSOut {
   @location(1) @interpolate(flat) centerV: vec3f,
   @location(2) @interpolate(flat) speed: f32,
   @location(3) @interpolate(flat) viewZ: f32,
+  @location(4) @interpolate(flat) pr: f32, // effective splat radius (spray shrink)
 };
 
 fn pointCorner(vi: u32) -> vec2f {
@@ -511,12 +538,14 @@ fn pointVS(vi: u32, ii: u32, scale: f32, sizeMul: f32) -> PointVSOut {
   if (pa.w < 0.0) {
     o.pos = vec4f(2.0, 2.0, 2.0, 1.0);
     o.q = vec2f(0.0); o.centerV = vec3f(0.0); o.speed = 0.0; o.viewZ = 0.0;
+    o.pr = 0.0;
     return o;
   }
+  let pr = splatRadius(ii);
   let wp = pa.xyz * (2.0 / GRIDF) - vec3f(1.0);
   let center = (R.view * vec4f(wp, 1.0)).xyz;
   let z = max(-center.z, 0.05);
-  let sizePx = clamp(scale * PRADIUS * sizeMul / z, 1.0, 96.0);
+  let sizePx = clamp(scale * pr * sizeMul / z, 1.0, 96.0);
   let hs = sizePx * z / scale; // view-space half extent matching the px size
   let corner = pointCorner(vi);
   o.pos = R.proj * vec4f(center + vec3f(corner * hs, 0.0), 1.0);
@@ -524,6 +553,7 @@ fn pointVS(vi: u32, ii: u32, scale: f32, sizeMul: f32) -> PointVSOut {
   o.centerV = center;
   o.speed = vel[ii].w / VMAX;
   o.viewZ = z;
+  o.pr = pr;
   return o;
 }
 
@@ -545,7 +575,7 @@ fn fsPoints(v: PointVSOut) -> PointOut {
   let zc = sqrt(1.0 - r2);
   let n = vec3f(q, zc);
 
-  let fp = v.centerV + n * PRADIUS;
+  let fp = v.centerV + n * v.pr;
   let clip = R.proj * vec4f(fp, 1.0);
   var o: PointOut;
   o.depth = clamp(clip.z / clip.w, 0.0, 1.0);
@@ -584,7 +614,7 @@ fn fsPointDepth(v: PointVSOut) -> DepthOut {
   let q = v.q;
   let r2 = dot(q, q);
   if (r2 > 1.0) { discard; }
-  let fp = v.centerV + vec3f(q, sqrt(1.0 - r2)) * PRADIUS;
+  let fp = v.centerV + vec3f(q, sqrt(1.0 - r2)) * v.pr;
   let clip = R.proj * vec4f(fp, 1.0);
   var o: DepthOut;
   o.depth = clamp(clip.z / clip.w, 0.0, 1.0);
@@ -616,8 +646,9 @@ fn fsThick(v: PointVSOut) -> @location(0) vec4f {
   // background wherever the near water is sparse (fake holes).
   var keep = 1.0;
   if (front > 0.0 && v.viewZ > front + 0.3) { keep = 0.0; }
+  // Amplitude follows the effective radius so shrunken droplets absorb less.
   let f = 1.0 - r2;
-  let th = f * f * PRADIUS * 2.0;
+  let th = f * f * v.pr * 2.0;
   return vec4f(th * keep, th * v.speed * keep, th, 1.0);
 }
 
@@ -714,8 +745,11 @@ fn anisoVS(vi: u32, ii: u32, scale: f32, sizeMul: f32) -> AnisoVSOut {
   if (abs(axis.y) > 0.9) { refv = vec3f(1.0, 0.0, 0.0); }
   let m1 = normalize(cross(axis, refv));
   let m2 = cross(axis, m1);
-  let ra = PRADIUS * elong * sizeMul;              // major semi-axis
-  let rb = PRADIUS * inverseSqrt(elong) * sizeMul; // minors conserve volume
+  // Spray shrink scales both semi-axes; the thickness amplitude follows via
+  // its existing 2/|qz| footprint normalization (no extra plumbing needed).
+  let pr = splatRadius(ii);
+  let ra = pr * elong * sizeMul;              // major semi-axis
+  let rb = pr * inverseSqrt(elong) * sizeMul; // minors conserve volume
 
   // Conservative quad: exact orthographic extents of the projected ellipse
   // per screen axis (row norms of the semi-axis matrix), square because the
