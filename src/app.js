@@ -531,7 +531,7 @@ function step() {
 
 const DEBUG = params.has('dbg');
 // ?dbg also exposes a diagnostics handle for readback-based harnesses.
-if (DEBUG) window.__wf = { backend, cam, params: { get GRID() { return GRID; }, get PTEX() { return PTEX; } } };
+if (DEBUG) window.__wf = { backend, cam, rockData, params: { get GRID() { return GRID; }, get PTEX() { return PTEX; } } };
 const WARM = parseInt(params.get('warm') || '0', 10);
 for (let i = 0; i < WARM; i++) step();
 

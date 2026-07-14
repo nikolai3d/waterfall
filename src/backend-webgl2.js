@@ -501,6 +501,15 @@ export async function createBackend({ canvas, fail }) {
     return buf;
   }
 
+  function readAux() {
+    const P = cfg.PTEX;
+    const buf = new Float32Array(P * P * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, densFBO);
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    gl.readPixels(0, 0, P, P, gl.RGBA, gl.FLOAT, buf);
+    return buf;
+  }
+
   function dispose() {
     teardownSim();
     if (RT) {
@@ -515,7 +524,7 @@ export async function createBackend({ canvas, fail }) {
   // r=mesh and r=trace are WebGPU-only and fall back to the ssf path here,
   // and the app shell reports that in the stats line (`mesh→ssf`).
   return {
-    name: 'webgl2', init, substep, render, readParticles, dispose,
+    name: 'webgl2', init, substep, render, readParticles, readAux, dispose,
     effectiveMode: (mode) => (mode === 'mesh' || mode === 'trace' ? 'ssf' : mode),
   };
 }

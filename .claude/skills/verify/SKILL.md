@@ -90,12 +90,26 @@ python3 serve.py   # repo-root dev server: threaded + no-store (required)
 
 ## Sim-state diagnostics (readback beats screenshots)
 
-`?dbg=1` exposes `window.__wf` (backend handle + live params). For "is this
-a sim bug or a render bug?" questions, read particle state directly in a
-real-time harness: `await __wf.backend.readParticles()` (pos+age) twice a
-few seconds apart finds stuck/hovering particles by displacement;
-`readC()` (WebGPU) returns the C-matrix buffer incl. the isolation signal
-in `[i*12+3]`. NOTE: the dev server must send no-store headers (use the repo's serve.py) — the plain `python3 -m http.server` lets
+`?dbg=1` exposes `window.__wf` (backend handle + live params + `rockData`,
+the live rock centers/radii in grid units — needed to correlate particles
+with rock surfaces after drags). For "is this a sim bug or a render bug?"
+questions, read particle state directly in a real-time harness:
+`await __wf.backend.readParticles()` (pos+age) twice a few seconds apart
+finds stuck/hovering particles by displacement; `readC()` (WebGPU) returns
+the C-matrix buffer incl. the isolation signal in `[i*12+3]` and the
+stagnation counter in `[i*12+7]`; `readAux()` (both backends) returns the
+density pass — `[i*4]` is per-particle ρ (≈4 in the pool, <2.8 = visually
+distinct airborne bead); `readVel()` (WebGPU) the velocity buffer.
+
+Detector that settled the "hanging droplets" bug (2026-07-13): sample
+POS+AUX every 800ms and flag particles staying within 0.5 cells for ≥3
+consecutive samples while ρ<2.8 and y>3. Pool-surface bobbers alias into
+short runs when a wave crest briefly drops their ρ to ~2 — read the ρ
+trajectory before calling something a hoverer. For the VISUAL layer, blob
+tracking on a frame sequence (threshold `min(r,g,b)>150`, blobs 2–400px,
+chain centroids <6px/frame) works, but every persistent track found so far
+was a rock-waterline or wave-crest specular highlight — crop and look
+before believing it. NOTE: the dev server must send no-store headers (use the repo's serve.py) — the plain `python3 -m http.server` lets
 Chrome heuristically cache modules, so a user's tab can silently test
 STALE code while fresh headless profiles test new code.
 

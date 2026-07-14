@@ -246,9 +246,9 @@ export async function createBackend({ canvas, fail }) {
 
     const ST = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
     bufPos = buf(cfg.N * 16, ST | GPUBufferUsage.COPY_SRC, cfg.initialData);
-    bufVel = buf(cfg.N * 16, ST, new Float32Array(cfg.N * 4));
+    bufVel = buf(cfg.N * 16, ST | GPUBufferUsage.COPY_SRC, new Float32Array(cfg.N * 4));
     bufC = buf(cfg.N * 48, ST | GPUBufferUsage.COPY_SRC, new Float32Array(cfg.N * 12));
-    bufAux = buf(cfg.N * 16, ST);
+    bufAux = buf(cfg.N * 16, ST | GPUBufferUsage.COPY_SRC);
     bufGridA = buf(NCELL * 16, ST);
     bufGridV = buf(NCELL * 16, ST);
     bufSimU = buf(144, UNI);
@@ -866,8 +866,25 @@ export async function createBackend({ canvas, fail }) {
     device.queue.submit([enc.finish()]);
   }
 
-  // Debug readback of the C-matrix buffer (cmat[3i].w = isolation) — used
-  // by ?dbg diagnostics; same staging pattern as readParticles.
+  // Debug readbacks for ?dbg diagnostics; same staging pattern as
+  // readParticles. readC: cmat ([3i].w = isolation, [3i+1].w = stagnation);
+  // readAux: (rho, pressure, volume); readVel: (v, speed).
+  async function readBuf(srcBuf, size) {
+    const staging = device.createBuffer({
+      size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(srcBuf, 0, staging, 0, size);
+    device.queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Float32Array(staging.getMappedRange().slice(0));
+    staging.unmap();
+    staging.destroy();
+    return out;
+  }
+  const readAux = () => readBuf(bufAux, cfg.N * 16);
+  const readVel = () => readBuf(bufVel, cfg.N * 16);
+
   async function readC() {
     const size = cfg.N * 48;
     const staging = device.createBuffer({
@@ -907,7 +924,7 @@ export async function createBackend({ canvas, fail }) {
 
   // effectiveMode: this backend implements every render mode as selected.
   return {
-    name: 'webgpu', init, substep, render, readParticles, readC, dispose,
+    name: 'webgpu', init, substep, render, readParticles, readC, readAux, readVel, dispose,
     effectiveMode: (mode) => mode,
   };
 }
